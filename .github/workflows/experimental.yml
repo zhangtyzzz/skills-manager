@@ -1,0 +1,227 @@
+name: Experimental Build
+
+# Rolling "experimental" channel: every push to main builds all five
+# platforms and refreshes the assets on the rolling `experimental`
+# prerelease. No signing secrets are required — updater artifacts are
+# disabled via a config overlay (they would need TAURI_SIGNING_PRIVATE_KEY),
+# and macOS bundles are entirely unsigned, so Gatekeeper will quarantine
+# them.
+#
+# This channel can never hijack in-app updates: the updater endpoint is
+# `releases/latest/download/latest.json`, and GitHub's "latest" excludes
+# prereleases. No latest.json is produced here.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A newer push to main supersedes any experimental run still in flight.
+concurrency:
+  group: experimental-build
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    name: Prepare experimental release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Stamp experimental version
+        id: version
+        run: |
+          VERSION=$(grep -m1 '"version"' package.json | sed -E 's/.*"version": "([^"]+)".*/\1/')
+          if [ -z "$VERSION" ]; then
+            echo "Could not read the version from package.json" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}-experimental.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      # Created once here so the five build legs never race to create it.
+      # The tag stays where it was first cut; assets are refreshed per run
+      # and the release notes point at the run that produced them.
+      - name: Ensure the experimental prerelease exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES="Automated builds from the latest **main** (run [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }})).
+
+          - Version stamp: \`${{ steps.version.outputs.version }}\`
+          - macOS builds are **unsigned**: right-click → Open the first time, or run \`xattr -dr com.apple.quarantine /Applications/skills-manager.app\`.
+          - Windows may show a SmartScreen warning (unsigned installer) — choose \"More info → Run anyway\".
+          - Linux ships as an AppImage only (deb/rpm reject the prerelease version stamp).
+          - No in-app updates from this channel; the app updates to the next signed stable release normally."
+          if gh release view experimental --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit experimental --repo "${{ github.repository }}" --notes "$NOTES"
+          else
+            gh release create experimental --repo "${{ github.repository }}" \
+              --prerelease --title "Experimental builds" --notes "$NOTES"
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            label: macOS-arm64
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            label: macOS-x64
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux-x64
+          - platform: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: Linux-arm64
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    name: Build (${{ matrix.label }})
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux system dependencies
+        if: startsWith(matrix.platform, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Stamps a distinguishable version and adjusts bundling for an
+      # unsigned, no-updater build. The overlay is merged over
+      # tauri.conf.json by the Tauri CLI:
+      # - createUpdaterArtifacts=false: updater artifacts require
+      #   TAURI_SIGNING_PRIVATE_KEY, which experimental builds don't have.
+      # - targets drops "msi", "deb" and "rpm": their version fields only
+      #   accept numeric x.y.z and reject the `-experimental.N` semver
+      #   prerelease suffix (RPM forbids hyphens outright; the deb revision
+      #   would not compare as intended). NSIS and AppImage carry the stamp
+      #   in the filename only, so Linux ships as an AppImage.
+      - name: Write experimental config overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > unsigned-build.conf.json <<EOF
+          {
+            "version": "${{ needs.prepare.outputs.version }}",
+            "bundle": {
+              "createUpdaterArtifacts": false,
+              "targets": ["app", "dmg", "nsis", "appimage"]
+            }
+          }
+          EOF
+          cat unsigned-build.conf.json
+
+      # tauri.conf.json's beforeBuildCommand runs `npm run build`
+      # (tsc + vite) before bundling, so this is also the typecheck gate.
+      - name: Build with Tauri
+        shell: bash
+        run: npx tauri build --config unsigned-build.conf.json --target ${{ matrix.target }}
+
+      # vctip.exe (VC++ telemetry) locks files in target/ and intermittently
+      # breaks the post-job cache save — same mitigation as test.yml.
+      - name: Kill VC telemetry before cache save
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: taskkill /f /im vctip.exe
+
+      # Asset filenames embed the target arch, so the five legs upload
+      # disjoint names; --clobber covers re-runs of the same run number.
+      - name: Upload bundles to the experimental release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          assets=()
+          for pattern in \
+            'dmg/*.dmg' \
+            'nsis/*-setup.exe' \
+            'appimage/*.AppImage'; do
+            for file in $BUNDLE_DIR/$pattern; do
+              if [ -f "$file" ]; then
+                assets+=("$file")
+              fi
+            done
+          done
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No bundles found under $BUNDLE_DIR" >&2
+            ls -R "$BUNDLE_DIR" >&2 || true
+            exit 1
+          fi
+          printf 'Uploading:\n'
+          printf '  %s\n' "${assets[@]}"
+          gh release upload experimental --repo "${{ github.repository }}" \
+            "${assets[@]}" --clobber
+
+  # Version stamps are unique per run, so assets accumulate across runs;
+  # drop everything that did not come from this run once all legs finished.
+  # The stamp is matched with a trailing separator (`_` or `-`) because
+  # bundle filenames embed the version in the middle — a bare contains-check
+  # would confuse run 42 with run 429.
+  cleanup:
+    needs: [prepare, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    name: Prune stale assets
+    steps:
+      - name: Delete assets from older runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STAMP: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_id=$(gh api "repos/${{ github.repository }}/releases/tags/experimental" --jq .id)
+          gh api --paginate "repos/${{ github.repository }}/releases/${release_id}/assets" \
+            --jq '.[].id' | while read -r asset_id; do
+            name=$(gh api "repos/${{ github.repository }}/releases/assets/${asset_id}" --jq .name)
+            case "$name" in
+              *"${STAMP}_"*|*"${STAMP}-"*)
+                echo "Keeping $name"
+                ;;
+              *)
+                echo "Deleting stale asset $name"
+                gh api -X DELETE "repos/${{ github.repository }}/releases/assets/${asset_id}" >/dev/null
+                ;;
+            esac
+          done
