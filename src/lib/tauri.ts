@@ -623,6 +623,23 @@ export const githubDeviceFlowStart = () =>
 export const githubDeviceFlowPoll = (deviceCode: string, repoName: string) =>
   invoke<GithubDevicePollResult>("github_device_flow_poll", { deviceCode, repoName });
 
+export interface GitlabBackupConnectResult {
+  url: string;
+  login: string;
+  repo_created: boolean;
+  /** False when the connected project's visibility is not `private`. */
+  repo_private: boolean;
+  remote_has_content: boolean;
+}
+
+/** GitLab guided connect (PAT): validates the token against the instance
+ * (gitlab.com or self-hosted), finds or creates the private backup project,
+ * stores the token in the OS keychain, saves the URL. A bare project name
+ * targets the personal namespace; `group/sub/name` connects an existing
+ * project. */
+export const gitlabBackupConnect = (baseUrl: string, token: string, projectPath: string) =>
+  invoke<GitlabBackupConnectResult>("gitlab_backup_connect", { baseUrl, token, projectPath });
+
 /** Migrate token-in-URL remotes to the OS keychain. Returns the sanitized URL if migrated. */
 export const gitBackupMigrateCredentials = () =>
   invoke<string | null>("git_backup_migrate_credentials");

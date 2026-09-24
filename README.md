@@ -127,6 +127,7 @@ The **Backup** page (sidebar) keeps your skill library versioned in a Git reposi
 ### Connect
 
 - **Sign in with GitHub** (recommended): an 8-digit device-flow sign-in creates a private `skills-manager-backup` repository for you. The token is stored in the OS keychain — never in files or the repo config.
+- **Connect with GitLab**: works with gitlab.com or a self-hosted instance (for teams whose data must stay in-house). Paste a personal access token with the `api` scope; a bare project name creates a private project in your personal namespace, and a full path like `group/team/backup` connects an existing project. The token lives in the OS keychain, keyed by host.
 - **Advanced**: paste any Git URL (HTTPS + PAT, SSH, self-hosted) under **Settings → Git Sync Configuration**.
 - On a new machine with an empty library, the first launch asks: **start fresh, or restore from a backup?**
 

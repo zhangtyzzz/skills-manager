@@ -1,5 +1,12 @@
 name: Build & Release
 
+# Dual-mode by design: with the Apple and Tauri signing secrets configured it
+# runs the strict signed pipeline (a missing secret still fails loudly — see
+# the macOS key-import step and issue #138). Without them (typically a fork:
+# secrets do not copy over) it degrades to unsigned builds with warnings —
+# macOS ad-hoc, no updater assets — so a fork can still cut releases instead
+# of every leg failing.
+
 on:
   push:
     tags:
@@ -10,7 +17,49 @@ permissions:
   contents: write
 
 jobs:
+  # Secrets are invisible to `if:` conditions directly, so funnel them
+  # through job outputs. Forks inherit none of them.
+  detect-signing:
+    runs-on: ubuntu-latest
+    name: Detect signing credentials
+    outputs:
+      apple: ${{ steps.detect.outputs.apple }}
+      updater: ${{ steps.detect.outputs.updater }}
+    steps:
+      - name: Detect which signing secrets are configured
+        id: detect
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                      APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_BASE64; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "apple=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Apple signing secrets not configured (${missing[*]}) — macOS bundles will be unsigned and Gatekeeper will quarantine them."
+            echo "apple=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "updater=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY not configured — building without updater artifacts; this release cannot serve in-app updates."
+            echo "updater=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: detect-signing
     strategy:
       fail-fast: false
       matrix:
@@ -156,8 +205,10 @@ jobs:
       # fall back to a linker-only signature that has no sealed resources and fails
       # `codesign --verify` (issue #138). The notarization key is delivered as
       # base64 because Tauri wants a path to the .p8, not its contents.
+      # The whole step is skipped when no Apple secrets exist (fork mode) — the
+      # bundles are then left unsigned, which Gatekeeper quarantines.
       - name: Prepare macOS signing credentials
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && needs.detect-signing.outputs.apple == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -190,24 +241,68 @@ jobs:
             exit 1
           fi
           echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+          # Re-export the signing variables for the tauri-action step below.
+          # Presence matters: tauri-bundler gates its keychain import on the
+          # variable EXISTING (no emptiness check), so in fork mode they must
+          # be absent entirely — an empty-string export would send it into a
+          # doomed `security import` of nothing (tauri#9760). This step only
+          # runs in signed mode, which is exactly when they are non-empty.
+          for name in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_SIGNING_IDENTITY \
+            APPLE_API_ISSUER \
+            APPLE_API_KEY; do
+            {
+              echo "$name<<EOF"
+              printenv "$name"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+          done
 
+      # Fork mode without TAURI_SIGNING_PRIVATE_KEY: updater artifacts cannot
+      # be signed, so disable them (the verify-updater-assets job is skipped
+      # to match) instead of failing the build. The overlay is merged over
+      # tauri.conf.json by tauri's --config.
+      - name: Write unsigned-updater config overlay
+        if: needs.detect-signing.outputs.updater == 'false'
+        shell: bash
+        run: printf '{"bundle":{"createUpdaterArtifacts":false}}' > unsigned-updater.conf.json
+
+      # Same presence-vs-empty rule as the Apple variables: export the
+      # updater signing key only when it exists, via $GITHUB_ENV (inherited
+      # by the tauri-action step below). Fork mode builds with updater
+      # artifacts disabled and never reads it — but an empty-string export
+      # is not guaranteed to be inert, so keep it absent there. The password
+      # stays unset for unencrypted keys instead of being exported empty.
+      - name: Export updater signing key
+        if: needs.detect-signing.outputs.updater == 'true'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY<<EOF"
+            printenv TAURI_SIGNING_PRIVATE_KEY
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            {
+              echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD<<EOF"
+              printenv TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+          fi
+
+      # macOS signing/notarization variables and the updater key arrive via
+      # $GITHUB_ENV from the steps above — present only in their modes, absent
+      # in fork mode (see the presence-vs-empty notes there).
       - name: Build with Tauri
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Sign macOS bundles with the Developer ID Application certificate and
-          # notarize them with Apple, so a downloaded build opens without any
-          # Gatekeeper prompt. Signing alone is not enough: macOS 10.15+ blocks
-          # quarantined apps that carry no notarization ticket.
-          # APPLE_API_KEY_PATH comes from the previous step via $GITHUB_ENV, and is
-          # only set on macOS runners.
-          APPLE_CERTIFICATE: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_SIGNING_IDENTITY || '' }}
-          APPLE_API_ISSUER: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_API_ISSUER || '' }}
-          APPLE_API_KEY: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_API_KEY || '' }}
         with:
           tagName: v__VERSION__
           releaseName: 'Skills Manager v__VERSION__'
@@ -220,10 +315,12 @@ jobs:
           releaseDraft: true
           prerelease: false
           updaterJsonKeepUniversal: true
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }}${{ needs.detect-signing.outputs.updater == 'false' && ' --config unsigned-updater.conf.json' || '' }}
 
+      # Ad-hoc signed bundles (fork mode) carry no Developer ID identity and no
+      # notarization ticket by definition, so verification only runs in signed mode.
       - name: Verify macOS signature and notarization
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && needs.detect-signing.outputs.apple == 'true'
         run: |
           set -euo pipefail
           verify_bundle() {
@@ -291,7 +388,7 @@ jobs:
           fi
 
       - name: Sign and notarize macOS CLI binary
-        if: startsWith(matrix.platform, 'macos')
+        if: startsWith(matrix.platform, 'macos') && needs.detect-signing.outputs.apple == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -390,9 +487,10 @@ jobs:
             --repo "${{ github.repository }}" \
             "$CLI_UPLOAD" --clobber
 
+  # Skipped in fork mode (no updater artifacts are produced there).
   verify-updater-assets:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [detect-signing, build]
+    if: startsWith(github.ref, 'refs/tags/') && needs.detect-signing.outputs.updater == 'true'
     runs-on: ubuntu-latest
     name: Verify updater assets
     steps:
@@ -478,8 +576,13 @@ jobs:
           echo "Updater assets validation passed"
 
   publish-release:
-    needs: [build, verify-updater-assets]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [detect-signing, build, verify-updater-assets]
+    # verify-updater-assets is skipped in fork mode; treat a skip as passing
+    # while still requiring every job that ran to have succeeded.
+    if: >-
+      startsWith(github.ref, 'refs/tags/')
+      && !failure() && !cancelled()
+      && (needs.verify-updater-assets.result == 'success' || needs.verify-updater-assets.result == 'skipped')
     runs-on: ubuntu-latest
     name: Publish release
     steps:

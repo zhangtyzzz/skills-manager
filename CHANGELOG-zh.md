@@ -5,6 +5,11 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 用户可见更新
+- **备份：GitLab 引导连接** —— 备份页连接卡片新增 GitHub / GitLab 切换。GitLab 支持 gitlab.com 或自建实例（数据不出内网的企业场景）：粘贴带 `api` 权限的个人访问令牌，填裸项目名会在个人命名空间自动创建私有项目，填完整路径（如 `group/team/backup`）则连接已有项目。令牌按域名存入系统钥匙串（同步引擎本来就在用的存储），撤销授权 / 重连 / 删除远端的指引也会按提供商区分。GitLab 不支持设备码登录，引导连接即令牌方式；SSH 用户可继续在 **设置 → Git 同步配置** 粘贴远程地址。
+
 ## [1.40.0] - 2026-09-17
 
 ### 发布概览
