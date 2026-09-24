@@ -1,6 +1,6 @@
 use crate::core::{
     central_repo, error::AppError, git2_engine, git_backup, git_credentials, git_fetcher,
-    github_api, merge, skill_metadata, sync_metadata,
+    github_api, gitlab_api, merge, skill_metadata, sync_metadata,
 };
 use anyhow::Context;
 use std::path::Path;
@@ -214,6 +214,9 @@ fn connect_with_token(
     store
         .set_setting("github_auth_method", method)
         .map_err(AppError::db)?;
+    store
+        .set_setting("git_backup_provider", "github")
+        .map_err(AppError::db)?;
 
     let remote_has_content =
         git_backup::remote_has_heads(&info.url).map_err(classify_git_chain)?;
@@ -282,6 +285,90 @@ pub async fn github_device_flow_poll(
     .await?
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GitlabBackupConnectResult {
+    /// Credential-free HTTPS URL of the backup repository.
+    pub url: String,
+    pub login: String,
+    pub repo_created: bool,
+    /// False when the connected project's visibility is not `private` — the
+    /// UI warns; app-created projects are always private.
+    pub repo_private: bool,
+    /// True when the remote already has commits — the frontend restores
+    /// (clones) instead of initializing a fresh backup.
+    pub remote_has_content: bool,
+}
+
+/// GitLab guided connect: validate the PAT against the instance (gitlab.com
+/// or self-hosted), find the project — creating a private one in the token
+/// owner's personal namespace for a bare name — store the token in the OS
+/// keychain, and save the credential-free URL. The keychain is keyed by host
+/// (incl. port), so self-hosted instances need no extra wiring. GitLab has no
+/// Device Flow, so the PAT is the only guided auth path.
+#[tauri::command]
+pub async fn gitlab_backup_connect(
+    store: State<'_, Arc<SkillStore>>,
+    base_url: String,
+    token: String,
+    project_path: String,
+) -> Result<GitlabBackupConnectResult, AppError> {
+    let store = store.inner().clone();
+    sync_engine_pref(&store);
+    tokio::task::spawn_blocking(move || {
+        let token = token.trim();
+        let project_path = project_path.trim();
+        if token.is_empty() {
+            return Err(AppError::invalid_input("Token is empty"));
+        }
+        if !gitlab_api::is_valid_project_path(project_path) {
+            return Err(AppError::invalid_input("Invalid project path"));
+        }
+
+        let proxy_url = store.proxy_url();
+        let info = gitlab_api::connect_backup_project(
+            &base_url,
+            token,
+            project_path,
+            proxy_url.as_deref(),
+        )
+        .map_err(AppError::network)?;
+
+        let host = git_credentials::https_host(&info.url)
+            .context("GITLAB_URL_INVALID: remote URL has no https host")
+            .map_err(AppError::internal)?;
+        git_credentials::store_credential(
+            &host,
+            &git_credentials::RemoteCredential {
+                username: info.username.clone(),
+                password: token.to_string(),
+            },
+        )
+        .map_err(|e| AppError::internal(format!("KEYCHAIN_UNAVAILABLE: {e:#}")))?;
+
+        store
+            .set_setting("git_backup_remote_url", &info.url)
+            .map_err(AppError::db)?;
+        store
+            .set_setting("git_backup_provider", "gitlab")
+            .map_err(AppError::db)?;
+        store
+            .set_setting("gitlab_base_url", &info.base_url)
+            .map_err(AppError::db)?;
+
+        let remote_has_content =
+            git_backup::remote_has_heads(&info.url).map_err(classify_git_chain)?;
+
+        Ok(GitlabBackupConnectResult {
+            url: info.url,
+            login: info.username,
+            repo_created: info.project_created,
+            repo_private: info.project_private,
+            remote_has_content,
+        })
+    })
+    .await?
+}
+
 /// Sanitize a remote URL before it is persisted anywhere: embedded
 /// credentials go to the OS keychain, the returned URL is what the frontend
 /// must save and display.
@@ -334,6 +421,8 @@ fn disconnect_local(store: &SkillStore, skills_dir: &Path) -> Result<(), AppErro
         .set_setting("git_backup_remote_url", "")
         .map_err(AppError::db)?;
     let _ = store.set_setting("github_auth_method", "");
+    let _ = store.set_setting("git_backup_provider", "");
+    let _ = store.set_setting("gitlab_base_url", "");
 
     for host in hosts {
         if let Err(e) = git_credentials::delete_credential(&host) {

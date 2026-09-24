@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### User-facing
+- **Backup: guided GitLab connect** — The Backup page's connect card gains a GitHub / GitLab switch. GitLab works with gitlab.com or a self-hosted instance (for teams whose data must stay in-house): paste a personal access token with the `api` scope and a bare project name to auto-create a private project in your personal namespace, or a full path like `group/team/backup` to connect an existing project. The token is stored in the OS keychain keyed by host — the same storage the sync engine already uses — and revoke/reconnect/delete-remote guidance is provider-aware. GitLab has no device-flow sign-in, so the PAT is the guided path; SSH users can keep pasting a remote URL under **Settings → Git Sync Configuration**.
+
 ## [1.40.0] - 2026-09-17
 
 ### Release Overview

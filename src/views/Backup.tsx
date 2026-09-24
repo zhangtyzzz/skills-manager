@@ -7,6 +7,7 @@ import {
   Copy,
   ExternalLink,
   Github,
+  Gitlab,
   History,
   Loader2,
   Pencil,
@@ -47,11 +48,18 @@ type BackupMode =
   | "up_to_date"
   | "pending_changes";
 
-type LoadingAction = "start" | "sync" | "recovery" | "save" | "disconnect" | "github" | null;
+type LoadingAction = "start" | "sync" | "recovery" | "save" | "disconnect" | "github" | "gitlab" | null;
 
-const DEFAULT_GITHUB_REPO = "skills-manager-backup";
+const DEFAULT_BACKUP_REPO = "skills-manager-backup";
 const GITHUB_TOKEN_URL =
   "https://github.com/settings/tokens/new?scopes=repo&description=Skills%20Manager%20Backup";
+const GITLAB_DEFAULT_BASE_URL = "https://gitlab.com";
+/** `scopes=api` pre-selects the scope needed to create the backup project. */
+const gitlabTokenUrl = (baseUrl: string) => {
+  const base = baseUrl.trim().replace(/\/+$/, "");
+  return `${base.includes("://") ? base : `https://${base}`}/-/user_settings/personal_access_tokens?scopes=api`;
+};
+type ConnectProvider = "github" | "gitlab";
 type RecoveryReason = GitUpstreamHealth | "conflict";
 
 function displaySnapshotLabel(tag: string) {
@@ -101,7 +109,7 @@ export function Backup() {
   const [backupError, setBackupError] = useState<string | null>(null);
   const [sizeReport, setSizeReport] = useState<GitBackupSizeReport | null>(null);
   const [githubToken, setGithubToken] = useState("");
-  const [githubRepoName, setGithubRepoName] = useState(DEFAULT_GITHUB_REPO);
+  const [githubRepoName, setGithubRepoName] = useState(DEFAULT_BACKUP_REPO);
   const [githubError, setGithubError] = useState<string | null>(null);
   const [patMode, setPatMode] = useState(false);
   const [deviceInfo, setDeviceInfo] = useState<api.GithubDeviceFlowStart | null>(null);
@@ -119,6 +127,15 @@ export function Backup() {
   const [deleteRemoteConfirmOpen, setDeleteRemoteConfirmOpen] = useState(false);
   const [reconnectMode, setReconnectMode] = useState(false);
   const [backupErrorRaw, setBackupErrorRaw] = useState("");
+  // Guided-connect provider switch + GitLab form state. `backupProvider`
+  // mirrors the persisted `git_backup_provider` setting so the disconnect /
+  // revoke / reconnect UI can be provider-aware.
+  const [connectProvider, setConnectProvider] = useState<ConnectProvider>("github");
+  const [backupProvider, setBackupProvider] = useState("");
+  const [gitlabBaseUrl, setGitlabBaseUrl] = useState(GITLAB_DEFAULT_BASE_URL);
+  const [gitlabProjectPath, setGitlabProjectPath] = useState(DEFAULT_BACKUP_REPO);
+  const [gitlabToken, setGitlabToken] = useState("");
+  const [gitlabError, setGitlabError] = useState<string | null>(null);
 
   // Abandon an in-flight device-flow poll loop when leaving the page.
   useEffect(() => () => {
@@ -212,6 +229,17 @@ export function Backup() {
         .catch(() => {});
       api.getSettings("github_auth_method")
         .then((v) => setAuthMethod((v ?? "").trim()))
+        .catch(() => {});
+      // Provider-aware disconnect/reconnect UI; prefill the GitLab instance
+      // from the last successful connect.
+      api.getSettings("git_backup_provider")
+        .then((v) => setBackupProvider((v ?? "").trim()))
+        .catch(() => {});
+      api.getSettings("gitlab_base_url")
+        .then((v) => {
+          const saved = (v ?? "").trim();
+          if (saved) setGitlabBaseUrl(saved);
+        })
         .catch(() => {});
       const savedRemote = (await api.getSettings("git_backup_remote_url").catch(() => null))?.trim() || "";
       setRemoteInput(savedRemote);
@@ -368,6 +396,12 @@ export function Backup() {
       // keychain and only the sanitized URL is saved and shown (§3.7).
       const effective = trimmed ? await api.gitBackupSanitizeRemoteUrl(trimmed) : "";
       await api.setSettings("git_backup_remote_url", effective);
+      // The manual path is provider-agnostic: drop any guided-connect
+      // provider mark so revoke/reconnect guidance doesn't reference a
+      // provider this remote may no longer point at. (The guided connect
+      // flows set the mark themselves and don't pass through here.)
+      await api.setSettings("git_backup_provider", "");
+      setBackupProvider("");
       if (effective && gitStatus?.is_repo) {
         await api.gitBackupSetRemote(effective);
       }
@@ -555,24 +589,45 @@ export function Backup() {
     return mapGitError(error);
   };
 
-  /** Shared tail of both connect paths: wire the repo locally and either
-   * restore the existing backup or push the first one. */
-  const finishGithubConnect = async (res: api.GithubBackupConnectResult) => {
+  /** Shared tail of both connect paths and both providers: wire the repo
+   * locally and either restore the existing backup or push the first one. */
+  const finishConnect = async (
+    res: api.GithubBackupConnectResult | api.GitlabBackupConnectResult,
+    provider: ConnectProvider,
+  ) => {
     setReconnectMode(false);
     setBackupError(null);
     setBackupErrorRaw("");
     api.getSettings("github_auth_method")
       .then((v) => setAuthMethod((v ?? "").trim()))
       .catch(() => {});
+    api.getSettings("git_backup_provider")
+      .then((v) => setBackupProvider((v ?? "").trim()))
+      .catch(() => {});
+    api.getSettings("gitlab_base_url")
+      .then((v) => {
+        const saved = (v ?? "").trim();
+        if (saved) setGitlabBaseUrl(saved);
+      })
+      .catch(() => {});
     setRemoteInput(res.url);
     setRemoteConfig(res.url);
     if (res.repo_created) {
-      const repo = res.url.replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "");
-      toast.success(t("backup.github.repoCreated", { repo }));
+      const repo = res.url.replace(/^[a-z]+:\/\/[^/]+\//, "").replace(/\.git$/, "");
+      toast.success(
+        provider === "gitlab"
+          ? t("backup.gitlab.projectCreated", { repo })
+          : t("backup.github.repoCreated", { repo }),
+      );
     }
     if (!res.repo_private) {
       // Connecting a backup to a PUBLIC repo is almost never intentional.
-      toast.warning(t("backup.github.publicRepoWarning"), { duration: 15000 });
+      toast.warning(
+        provider === "gitlab"
+          ? t("backup.gitlab.publicProjectWarning")
+          : t("backup.github.publicRepoWarning"),
+        { duration: 15000 },
+      );
     }
     const status = await api.gitBackupStatus();
     if (res.remote_has_content) {
@@ -603,13 +658,48 @@ export function Backup() {
     try {
       const res = await api.githubBackupConnect(
         token,
-        githubRepoName.trim() || DEFAULT_GITHUB_REPO,
+        githubRepoName.trim() || DEFAULT_BACKUP_REPO,
       );
       // Token is in the OS keychain now; drop it from component state.
       setGithubToken("");
-      await finishGithubConnect(res);
+      await finishConnect(res, "github");
     } catch (error) {
       setGithubError(mapGithubError(error));
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const mapGitlabError = (error: unknown) => {
+    const message = getErrorMessage(error, "");
+    if (message.includes("GITLAB_TOKEN_INVALID")) return t("backup.gitlab.errorToken");
+    if (message.includes("GITLAB_SCOPE")) return t("backup.gitlab.errorScope");
+    if (message.includes("GITLAB_PROJECT_NOT_FOUND")) return t("backup.gitlab.errorProject");
+    if (message.includes("GITLAB_PROJECT_REJECTED")) return t("backup.gitlab.errorProjectRejected");
+    if (message.includes("GITLAB_URL_INVALID")) return t("backup.gitlab.errorUrl");
+    if (message.includes("KEYCHAIN_UNAVAILABLE")) return t("backup.gitlab.errorKeychain");
+    if (message.includes("GITLAB_NETWORK") || getErrorKind(error) === "network") {
+      return t("settings.gitErrorNetwork");
+    }
+    return mapGitError(error);
+  };
+
+  const handleGitlabConnect = async () => {
+    const token = gitlabToken.trim();
+    if (!token) return;
+    setLoading("gitlab");
+    setGitlabError(null);
+    try {
+      const res = await api.gitlabBackupConnect(
+        gitlabBaseUrl,
+        token,
+        gitlabProjectPath.trim() || DEFAULT_BACKUP_REPO,
+      );
+      // Token is in the OS keychain now; drop it from component state.
+      setGitlabToken("");
+      await finishConnect(res, "gitlab");
+    } catch (error) {
+      setGitlabError(mapGitlabError(error));
     } finally {
       setLoading(null);
     }
@@ -626,7 +716,7 @@ export function Backup() {
       setDeviceInfo(info);
       void openUrl(info.verification_uri);
 
-      const repoName = githubRepoName.trim() || DEFAULT_GITHUB_REPO;
+      const repoName = githubRepoName.trim() || DEFAULT_BACKUP_REPO;
       let intervalSec = Math.max(info.interval, 5);
       const deadline = Date.now() + info.expires_in * 1000;
       while (!deviceCancelRef.current && Date.now() < deadline) {
@@ -639,7 +729,7 @@ export function Backup() {
         }
         if (poll.status === "connected" && poll.result) {
           setDeviceInfo(null);
-          await finishGithubConnect(poll.result);
+          await finishConnect(poll.result, "github");
           return;
         }
         // "pending" → keep polling.
@@ -696,6 +786,10 @@ export function Backup() {
       await api.gitBackupRemoveRemote();
       setRemoteInput("");
       setRemoteConfig("");
+      // The backend clears these settings too — mirror locally so the
+      // provider-specific revoke/delete entries disappear immediately.
+      setAuthMethod("");
+      setBackupProvider("");
       toast.success(t("settings.gitDisconnected"));
       await refreshGitStatus();
     } catch {
@@ -710,46 +804,63 @@ export function Backup() {
   const GITHUB_OAUTH_CLIENT_ID = "Ov23li4a3SMdhIiKo7IE";
   const remoteUrlValue = gitStatus?.remote_url || remoteConfig || "";
   const isGithubRemote = remoteUrlValue.includes("github.com");
-  const githubRepoWebUrl = (() => {
+  // Guided-connect provider ("" = wired by hand via a custom remote — those
+  // get no provider-specific revoke/reconnect UX). Installs connected before
+  // the setting existed fall back to github.com host detection.
+  const provider = backupProvider || (isGithubRemote ? "github" : "");
+  const isGitlabProvider = provider === "gitlab";
+  const gitlabBase = gitlabBaseUrl.trim().replace(/\/+$/, "");
+  const remoteRepoWebUrl = (() => {
+    if (isGitlabProvider) {
+      if (!remoteUrlValue.startsWith(`${gitlabBase}/`)) return null;
+      const path = remoteUrlValue.slice(gitlabBase.length + 1).replace(/\.git$/, "");
+      return path ? `${gitlabBase}/${path}` : null;
+    }
     const match = remoteUrlValue.match(/github\.com[/:]([^/]+\/[^/]+?)(\.git)?$/);
     return match ? `https://github.com/${match[1]}` : null;
   })();
-  // Token revoked/expired on the GitHub side → offer an explicit reconnect
-  // instead of only a failure card (backup redesign Phase 2 待办).
+  // Token revoked/expired on the provider's side → offer an explicit
+  // reconnect instead of only a failure card (backup redesign Phase 2 待办).
   const authErrorNeedsReconnect =
-    isGithubRemote
+    provider !== ""
     && /authentication failed|401|403|invalid.{0,24}(credentials|token)|could not read username/i.test(
       backupErrorRaw,
     );
 
-  // §3.1 row 2: revoking is done on GitHub's side (a public device-flow app
-  // has no client secret, so tokens cannot be revoked via API) — open the
-  // right page and disconnect this machine.
+  // §3.1 row 2: revoking is done on the provider's side (guided tokens can't
+  // be revoked via API) — open the right page and disconnect this machine.
   const handleRevokeAuthorization = async () => {
     setRevokeConfirmOpen(false);
-    const oauthUrl = `https://github.com/settings/connections/applications/${GITHUB_OAUTH_CLIENT_ID}`;
-    const patUrl = "https://github.com/settings/tokens";
-    if (authMethod === "pat") {
-      openUrl(patUrl).catch(() => {});
-    } else if (authMethod === "oauth") {
-      openUrl(oauthUrl).catch(() => {});
+    if (isGitlabProvider) {
+      openUrl(`${gitlabBase}/-/user_settings/personal_access_tokens`).catch(() => {});
     } else {
-      // Connected before the method was recorded (or wired manually): the
-      // credential could be either kind — open both pages so nothing stays
-      // silently authorized.
-      openUrl(oauthUrl).catch(() => {});
-      openUrl(patUrl).catch(() => {});
+      const oauthUrl = `https://github.com/settings/connections/applications/${GITHUB_OAUTH_CLIENT_ID}`;
+      const patUrl = "https://github.com/settings/tokens";
+      if (authMethod === "pat") {
+        openUrl(patUrl).catch(() => {});
+      } else if (authMethod === "oauth") {
+        openUrl(oauthUrl).catch(() => {});
+      } else {
+        // Connected before the method was recorded (or wired manually): the
+        // credential could be either kind — open both pages so nothing stays
+        // silently authorized.
+        openUrl(oauthUrl).catch(() => {});
+        openUrl(patUrl).catch(() => {});
+      }
     }
     await handleDisconnect();
   };
 
-  // §3.1 row 3: repo deletion needs the `delete_repo` scope our tokens
-  // deliberately don't have — GitHub's own settings page (with its type-the-
-  // repo-name confirmation) is the safe double-confirm path.
+  // §3.1 row 3: repo deletion needs permissions our tokens deliberately don't
+  // have — the provider's own settings page (with its type-the-name
+  // confirmation) is the safe double-confirm path.
   const handleOpenDeleteRemote = async () => {
     setDeleteRemoteConfirmOpen(false);
-    if (githubRepoWebUrl) {
-      await openUrl(`${githubRepoWebUrl}/settings#danger-zone`).catch(() => {});
+    if (remoteRepoWebUrl) {
+      const settingsUrl = isGitlabProvider
+        ? `${remoteRepoWebUrl}/-/settings/general`
+        : `${remoteRepoWebUrl}/settings#danger-zone`;
+      await openUrl(settingsUrl).catch(() => {});
       toast.info(t("backup.disconnect.deleteRemoteOpened"), { duration: 12000 });
     }
   };
@@ -847,12 +958,15 @@ export function Backup() {
                 {authErrorNeedsReconnect && (
                   <button
                     type="button"
-                    onClick={() => setReconnectMode(true)}
+                    onClick={() => {
+                      setConnectProvider(isGitlabProvider ? "gitlab" : "github");
+                      setReconnectMode(true);
+                    }}
                     disabled={!!loading}
                     className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[13px] font-medium text-amber-700 transition-colors hover:bg-amber-500/15 disabled:opacity-50 dark:text-amber-300"
                   >
-                    <Github className="h-3.5 w-3.5" />
-                    {t("backup.github.reconnect")}
+                    {isGitlabProvider ? <Gitlab className="h-3.5 w-3.5" /> : <Github className="h-3.5 w-3.5" />}
+                    {isGitlabProvider ? t("backup.gitlab.reconnect") : t("backup.github.reconnect")}
                   </button>
                 )}
                 {mode === "needs_fix" ? (
@@ -977,14 +1091,115 @@ export function Backup() {
           {(reconnectMode || (!gitStatus?.remote_url && !remoteConfig)) && (
             <section className="app-panel p-4">
               <div className="mb-3 flex items-center gap-2">
-                <Github className="h-4 w-4 text-muted" />
+                {connectProvider === "gitlab" ? (
+                  <Gitlab className="h-4 w-4 text-muted" />
+                ) : (
+                  <Github className="h-4 w-4 text-muted" />
+                )}
                 <h2 className="text-[14px] font-semibold text-secondary">
-                  {reconnectMode ? t("backup.github.reconnectTitle") : t("backup.github.title")}
+                  {reconnectMode
+                    ? connectProvider === "gitlab"
+                      ? t("backup.gitlab.reconnectTitle")
+                      : t("backup.github.reconnectTitle")
+                    : connectProvider === "gitlab"
+                      ? t("backup.gitlab.title")
+                      : t("backup.github.title")}
                 </h2>
+                <div className="ml-auto flex items-center gap-0.5 rounded-lg border border-border-subtle bg-bg-secondary p-0.5">
+                  {(["github", "gitlab"] as const).map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      onClick={() => setConnectProvider(p)}
+                      disabled={!!loading}
+                      className={cn(
+                        "rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors disabled:opacity-50",
+                        connectProvider === p
+                          ? "bg-surface-active text-secondary"
+                          : "text-tertiary hover:text-secondary",
+                      )}
+                    >
+                      {p === "github" ? "GitHub" : "GitLab"}
+                    </button>
+                  ))}
+                </div>
               </div>
-              <p className="mb-3 text-[13px] leading-5 text-muted">{t("backup.github.desc")}</p>
+              <p className="mb-3 text-[13px] leading-5 text-muted">
+                {connectProvider === "gitlab" ? t("backup.gitlab.desc") : t("backup.github.desc")}
+              </p>
 
-              {deviceInfo ? (
+              {connectProvider === "gitlab" ? (
+                // GitLab guided connect: PAT only — GitLab (especially
+                // self-hosted) has no device-flow login.
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={gitlabBaseUrl}
+                      onChange={(event) => setGitlabBaseUrl(event.target.value)}
+                      disabled={loading === "gitlab"}
+                      title={t("backup.gitlab.baseUrlLabel")}
+                      placeholder={t("backup.gitlab.baseUrlPlaceholder")}
+                      className="h-8 w-56 rounded-lg border border-border-subtle bg-background px-2.5 font-mono text-[13px] text-secondary outline-none transition-colors focus:border-border disabled:opacity-50"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                    />
+                    <input
+                      type="text"
+                      value={gitlabProjectPath}
+                      onChange={(event) => setGitlabProjectPath(event.target.value)}
+                      disabled={loading === "gitlab"}
+                      title={t("backup.gitlab.projectLabel")}
+                      placeholder={t("backup.gitlab.projectPlaceholder")}
+                      className="h-8 w-52 rounded-lg border border-border-subtle bg-background px-2.5 font-mono text-[13px] text-secondary outline-none transition-colors focus:border-border disabled:opacity-50"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="password"
+                      value={gitlabToken}
+                      onChange={(event) => {
+                        setGitlabToken(event.target.value);
+                        setGitlabError(null);
+                      }}
+                      placeholder={t("backup.gitlab.tokenPlaceholder")}
+                      disabled={loading === "gitlab"}
+                      className="h-8 min-w-0 flex-1 rounded-lg border border-border-subtle bg-background px-2.5 font-mono text-[13px] text-secondary outline-none transition-colors focus:border-border disabled:opacity-50"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                    />
+                    <button
+                      type="button"
+                      onClick={handleGitlabConnect}
+                      disabled={!!loading || !gitlabToken.trim()}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface-hover px-2.5 text-[13px] font-medium text-tertiary transition-colors hover:bg-surface-active disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {loading === "gitlab" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      {loading === "gitlab" ? t("backup.gitlab.connecting") : t("backup.gitlab.connect")}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void openUrl(gitlabTokenUrl(gitlabBaseUrl))}
+                    className="inline-flex items-center gap-1 text-[12px] text-muted transition-colors hover:text-secondary"
+                  >
+                    <ExternalLink className="h-3 w-3" />
+                    {t("backup.gitlab.tokenHint")}
+                  </button>
+                  <p className="text-[12px] leading-4 text-faint">{t("backup.gitlab.projectHint")}</p>
+                  <p className="text-[12px] leading-4 text-faint">{t("backup.gitlab.sshHint")}</p>
+                  {gitlabError && (
+                    <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-[12px] leading-5 text-red-600 dark:text-red-300">
+                      {gitlabError}
+                    </div>
+                  )}
+                </div>
+              ) : deviceInfo ? (
                 <div className="space-y-3">
                   <div className="flex flex-col items-center gap-2 rounded-md border border-border-subtle bg-bg-secondary px-4 py-4">
                     <div className="font-mono text-[26px] font-bold tracking-[0.25em] text-primary">
@@ -1257,7 +1472,7 @@ export function Backup() {
                 {loading === "disconnect" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Unlink className="h-3.5 w-3.5" />}
                 {t("settings.gitDisconnect")}
               </button>
-              {isGithubRemote && (
+              {provider !== "" && (
                 <button
                   type="button"
                   onClick={() => setRevokeConfirmOpen(true)}
@@ -1269,22 +1484,26 @@ export function Backup() {
                 </button>
               )}
             </div>
-            {isGithubRemote && (
+            {provider !== "" && (
               <p className="mt-2 text-[12px] leading-4 text-faint">
-                {authMethod === "pat"
+                {isGitlabProvider
+                  ? t("backup.gitlab.revokeHintPat")
+                  : authMethod === "pat"
                   ? t("backup.disconnect.revokeHintPat")
                   : authMethod === "oauth"
                     ? t("backup.disconnect.revokeHintOauth")
                     : t("backup.disconnect.revokeHintUnknown")}
               </p>
             )}
-            {githubRepoWebUrl && (
+            {remoteRepoWebUrl && (
               <div className="mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2.5">
                 <div className="text-[13px] font-medium text-red-700 dark:text-red-300">
                   {t("backup.disconnect.deleteRemote")}
                 </div>
                 <p className="mt-1 text-[12px] leading-4 text-red-700/80 dark:text-red-300/80">
-                  {t("backup.disconnect.deleteRemoteDesc")}
+                  {isGitlabProvider
+                    ? t("backup.gitlab.deleteRemoteDesc")
+                    : t("backup.disconnect.deleteRemoteDesc")}
                 </p>
                 <button
                   type="button"
@@ -1334,8 +1553,12 @@ export function Backup() {
       />
       <ConfirmDialog
         open={revokeConfirmOpen}
-        title={t("backup.disconnect.revokeConfirmTitle")}
-        message={authMethod === "pat"
+        title={isGitlabProvider
+          ? t("backup.gitlab.revokeConfirmTitle")
+          : t("backup.disconnect.revokeConfirmTitle")}
+        message={isGitlabProvider
+          ? t("backup.gitlab.revokeConfirmPat")
+          : authMethod === "pat"
           ? t("backup.disconnect.revokeConfirmPat")
           : authMethod === "oauth"
             ? t("backup.disconnect.revokeConfirmOauth")
@@ -1348,7 +1571,9 @@ export function Backup() {
       <ConfirmDialog
         open={deleteRemoteConfirmOpen}
         title={t("backup.disconnect.deleteRemoteAction")}
-        message={t("backup.disconnect.deleteRemoteConfirm")}
+        message={isGitlabProvider
+          ? t("backup.gitlab.deleteRemoteConfirm")
+          : t("backup.disconnect.deleteRemoteConfirm")}
         confirmLabel={t("backup.disconnect.deleteRemoteAction")}
         onClose={() => setDeleteRemoteConfirmOpen(false)}
         onConfirm={handleOpenDeleteRemote}
