@@ -29,7 +29,7 @@ export function InstallToast({ skillName, phase }: InstallToastProps) {
         {config.spinning ? (
           <Loader2 className="h-4 w-4 animate-spin text-accent" />
         ) : (
-          <Icon className="h-4 w-4 text-emerald-400" />
+          <Icon className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
         )}
       </div>
       <span className="text-[13px] text-secondary">

@@ -33,7 +33,7 @@ export function Dashboard() {
 
   const coverageLabel = totalSkills === 0 ? "0" : `${syncedSkills}/${totalSkills}`;
   const syncCardIcon = divergedCount > 0 ? AlertTriangle : CheckCircle2;
-  const syncCardColor = divergedCount > 0 ? "text-amber-400" : "text-emerald-400";
+  const syncCardColor = divergedCount > 0 ? "text-amber-600 dark:text-amber-400" : "text-emerald-600 dark:text-emerald-400";
   const syncCardBg = divergedCount > 0 ? "bg-amber-500/[0.08]" : "bg-emerald-500/[0.08]";
 
   return (
@@ -72,7 +72,7 @@ export function Dashboard() {
             title: t("dashboard.connectedAgents"),
             value: String(enabledAgents.length),
             icon: Bot,
-            color: "text-sky-400",
+            color: "text-sky-600 dark:text-sky-400",
             bg: "bg-sky-500/[0.08]",
           },
         ].map((stat, i) => {
@@ -86,7 +86,7 @@ export function Dashboard() {
                 <p className="app-section-title mb-1">
                   {stat.title}
                 </p>
-                <h3 className="text-xl font-semibold text-primary leading-none">{stat.value}</h3>
+                <h3 className="text-[17px] font-semibold text-primary leading-none">{stat.value}</h3>
               </div>
               <div className={`p-2 rounded-md ${stat.bg} ${stat.color} border border-border-subtle`}>
                 <Icon className="w-4 h-4" />
@@ -139,13 +139,13 @@ export function Dashboard() {
                 className="flex items-center justify-between px-3.5 py-2.5 hover:bg-surface-hover transition-colors cursor-pointer"
               >
                 <div className="flex items-center gap-2.5">
-                  <div className="w-6 h-6 rounded-[4px] flex items-center justify-center text-[13px] font-semibold bg-accent-bg text-accent-light shrink-0">
+                  <div className="w-6 h-6 rounded-md flex items-center justify-center text-[13px] font-semibold bg-accent-bg text-accent-light shrink-0">
                     {skill.name.charAt(0).toUpperCase()}
                   </div>
                   <div>
                     <h4 className="text-[13px] text-secondary font-medium flex items-center gap-1.5">
                       {skill.name}
-                      <span className="text-[9px] px-1.5 py-px rounded bg-surface-hover text-muted border border-border font-normal">
+                      <span className="text-[11px] px-1.5 py-px rounded-full bg-surface-hover text-muted border border-border font-normal">
                         {skill.source_type}
                       </span>
                     </h4>

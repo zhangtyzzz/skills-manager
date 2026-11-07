@@ -38,7 +38,7 @@ export function SkillSourceDiffViewer({ entries, className }: Props) {
             >
               {t(`mySkills.sourceDiff.status.${entry.status}`)}
             </span>
-            <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-secondary" title={entry.relative_path}>
+            <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-secondary" title={entry.relative_path}>
               {entry.relative_path}
             </span>
             {entry.status === "modified" && entry.executable_before !== entry.executable_after && (
@@ -58,7 +58,7 @@ export function SkillSourceDiffViewer({ entries, className }: Props) {
               className="!space-y-0 !rounded-none !border-0"
             />
           ) : (
-            <div className="px-4 py-4 text-[12.5px] text-muted">
+            <div className="px-4 py-4 text-[12px] text-muted">
               {t(`mySkills.sourceDiff.summary.${entry.content_kind}`)}
             </div>
           )}

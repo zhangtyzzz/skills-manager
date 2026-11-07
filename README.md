@@ -13,9 +13,11 @@
 </p>
 
 <p align="center">
-  🎬 <a href="https://www.youtube.com/watch?v=wfbCrfNASVU">Video intro (YouTube)</a>
+  🎬 <a href="https://www.youtube.com/watch?v=DJ9RIX8nbow">1.5-min intro (YouTube)</a>
   &nbsp;·&nbsp;
-  <a href="https://www.bilibili.com/video/BV1845F6REUu/">视频介绍 (Bilibili)</a>
+  <a href="https://www.youtube.com/watch?v=SNVD5ZN6QPE">Full walkthrough (9 min)</a>
+  &nbsp;·&nbsp;
+  <a href="https://www.bilibili.com/video/BV1cdpc6PExG/">视频介绍 (Bilibili)</a>
 </p>
 
 <p align="center">
@@ -97,6 +99,13 @@ You can also download the `.dmg` for your Mac from the [latest release](https://
 
 Download the installer for your platform from the [latest release](https://github.com/xingkongliang/skills-manager/releases/latest): `.exe` or `.msi` for Windows, and `.AppImage`, `.deb`, or `.rpm` for Linux (x64 and arm64).
 
+On Windows you can also install with [Scoop](https://scoop.sh):
+
+```powershell
+scoop bucket add extras
+scoop install extras/skills-manager
+```
+
 Every installer ships the CLI inside the app — see [Where the binary lives](#where-the-binary-lives).
 
 ## Quick Start
@@ -148,9 +157,9 @@ The Backup page offers three levels: **disconnect this machine** (other devices 
 
 ## Supported Tools
 
-54 agents are supported out of the box, including:
+56 agents are supported out of the box, including:
 
-Claude Code · Codex · Cursor · GitHub Copilot · Gemini CLI · GitLab Duo · OpenCode · OpenClaw · Hermes Agent · OpenHands · Cline · Goose · Windsurf · Continue · Grok · Antigravity · Qwen Code · ZCode · Crush · Kilo Code · Roo Code · Amp · Kiro CLI · Droid · TRAE IDE · Warp · Qoder · CodeBuddy
+Claude Code · Codex · Cursor · GitHub Copilot · Gemini CLI · GitLab Duo · OpenCode · OpenClaw · Hermes Agent · OpenHands · Cline · Goose · Windsurf · Continue · Grok · Antigravity · Qwen Code · ZCode · Crush · Kilo Code · Roo Code · Amp · Kiro CLI · Droid · TRAE IDE · Warp · Qoder · CodeBuddy · MiniMax Code
 
 **Settings** lists them all, leading with the ones detected on your machine. You can also add custom tools there and manage their skills the same way.
 
@@ -192,6 +201,7 @@ npm run cli -- skills show db
 npm run cli -- skills install ./my-skill
 npm run cli -- skills install https://github.com/foo/bar/tree/main/skills/baz
 npm run cli -- skills install vercel-labs/agent-skills@react-best-practices
+npm run cli -- skills install https://www.skills.sh/site/uizze.com/ui-radar # website-synced skill
 
 # Put it into the agents that should have it, then check
 npm run cli -- skills deploy react-best-practices --agent claude_code --agent codex
@@ -204,12 +214,14 @@ npm run cli -- skills adopt ~/.claude/skills --dry-run
 ```
 
 `--help` on any group or subcommand prints the full surface — the groups below
-each carry more than these examples show, and destructive commands take
-`--dry-run` (and `remove` requires `--yes`).
+each carry more than these examples show. `--dry-run` is available on selected
+commands, including `skills deploy/undeploy/sync/remove/adopt` and
+`presets deploy/undeploy/delete`; check each subcommand's help before using it.
+`skills remove` requires `--yes` for actual deletion.
 
 Available command groups:
 - `repo` — inspect or change the configured base directory
-- `agents` (`tools` alias) — list agents and globally enable or disable them
+- `agents` (`tools` alias) — list agents, globally enable or disable them, and add custom agents (`add-custom`)
 - `skills` — manage the central library and real per-agent deployments (`deploy / undeploy / status`)
 - `presets` — create, update, delete, organize, deploy, undeploy, and inspect presets
 - `git` — operate on the git-backed `skills/` repository (`clone`, `pull`, `push`, `commit`, `versions`, `restore`)
@@ -220,6 +232,20 @@ Extra flags:
 
 ```bash
 npm run -s cli -- --skills-root /path/to/my-skills --json skills list
+```
+
+#### Agents inside WSL
+
+The Windows app cannot create links inside WSL, so it can only copy skills there. If your agents live in WSL, run the Linux CLI inside WSL instead — it keeps its own library there and deploys with real symlinks:
+
+```bash
+mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/skills-manager-cli \
+  https://github.com/xingkongliang/skills-manager/releases/latest/download/skills-manager-cli-Linux-x64
+chmod +x ~/.local/bin/skills-manager-cli
+export PATH="$HOME/.local/bin:$PATH"
+skills-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
+skills-manager-cli skills install ./my-skill
+skills-manager-cli skills deploy my-skill --agent hermes-work
 ```
 
 #### Where the binary lives

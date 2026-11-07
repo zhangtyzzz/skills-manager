@@ -7,10 +7,11 @@ use crate::commands::projects::{
     classify_sync_status, ensure_dir_within_root, ensure_safe_skill_relative_path,
     source_ref_matches_skill_path, ProjectSkillDocumentDto,
 };
+use crate::core::repo_lock::RepoLock;
 use crate::core::skill_store::{SkillRecord, SkillStore, SkillTargetRecord};
 use crate::core::{
     content_hash, error::AppError, installer, project_scanner, scenario_service, sync_engine,
-    tool_adapters, tool_service,
+    sync_metadata, tool_adapters, tool_service,
 };
 
 fn target_path_equals_skill(target_path: &str, skill_path: &str) -> bool {
@@ -233,6 +234,7 @@ fn import_agent_local_skill_to_center(
     agent: &str,
     skill_relative_path: &str,
 ) -> Result<(), AppError> {
+    let _lock = RepoLock::acquire_foreground("import agent local skill").map_err(AppError::io)?;
     let adapter = adapter_for_agent(store, agent)?;
     let skill = find_agent_skill(&adapter, skill_relative_path)?;
 
@@ -283,8 +285,9 @@ fn import_agent_local_skill_to_center(
             store,
             &existing.id,
             agent,
-            scenario_service::DeployIntent::AdoptExisting,
+            scenario_service::DeployIntent::AdoptExisting(&source_path),
         )?;
+        sync_metadata::write_all_from_db_unlocked(store).map_err(AppError::io)?;
         return Ok(());
     }
 
@@ -325,12 +328,12 @@ fn import_agent_local_skill_to_center(
         store,
         &skill_record.id,
         agent,
-        scenario_service::DeployIntent::AdoptExisting,
+        scenario_service::DeployIntent::AdoptExisting(&source_path),
     ) {
         let _ = store.delete_skill(&skill_record.id);
         return Err(err);
     }
-    Ok(())
+    sync_metadata::write_all_from_db_unlocked(store).map_err(AppError::io)
 }
 
 /// Repair "stranded" center skills left behind by uploads that predate the
@@ -545,7 +548,7 @@ pub fn backfill_stranded_agent_targets(store: &SkillStore) -> usize {
                 store,
                 &matched.id,
                 &adapter.key,
-                scenario_service::DeployIntent::AdoptExisting,
+                scenario_service::DeployIntent::AdoptExisting(local_path),
             ) {
                 Ok(()) => {
                     repaired += 1;
@@ -694,11 +697,101 @@ mod tests {
     use crate::core::content_hash;
     use crate::core::project_scanner::ProjectSkillInfo;
     use crate::core::skill_store::{ScenarioRecord, SkillRecord, SkillStore};
-    use crate::core::{central_repo, installer, sync_engine, tool_adapters, tool_service};
+    use crate::core::{
+        central_repo, installer, scenario_service, sync_engine, sync_metadata, tool_adapters,
+        tool_service,
+    };
     use std::collections::HashMap;
 
     #[test]
-    fn importing_agent_local_skill_attaches_target_but_not_scenario() {
+    fn importing_nested_hermes_skill_preserves_same_named_category() {
+        let _guard = central_repo::test_base_dir_lock();
+        let temp = tempfile::tempdir().unwrap();
+        central_repo::set_test_base_dir_override(Some(temp.path().join("center")));
+        let store = SkillStore::new(&temp.path().join("store.db")).unwrap();
+
+        let skills_root = temp.path().join("hermes-skills");
+        let nested_skill = skills_root.join("software-development").join("github");
+        let other_skill = skills_root.join("github").join("github-auth");
+        std::fs::create_dir_all(&nested_skill).unwrap();
+        std::fs::create_dir_all(&other_skill).unwrap();
+        std::fs::write(nested_skill.join("SKILL.md"), "# github\n").unwrap();
+        std::fs::write(other_skill.join("SKILL.md"), "# github-auth\n").unwrap();
+        std::fs::write(other_skill.join("mine.txt"), "keep this category").unwrap();
+        store
+            .set_setting(
+                "custom_tool_paths",
+                &serde_json::json!({ "hermes": skills_root.to_string_lossy() }).to_string(),
+            )
+            .unwrap();
+
+        import_agent_local_skill_to_center(&store, "hermes", "software-development/github")
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(other_skill.join("mine.txt")).unwrap(),
+            "keep this category"
+        );
+        let targets = store.get_all_targets().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].target_path, nested_skill.to_string_lossy());
+        assert!(nested_skill.join("SKILL.md").exists());
+
+        let skill_id = targets[0].skill_id.clone();
+        scenario_service::sync_single_skill_to_tool(
+            &store,
+            &skill_id,
+            "hermes",
+            scenario_service::DeployIntent::Managed,
+        )
+        .unwrap();
+        scenario_service::apply_skills_to_tools(
+            &store,
+            &[skill_id.clone()],
+            &["hermes".to_string()],
+            scenario_service::BatchApplyMode::Add,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        store
+            .insert_scenario(&ScenarioRecord {
+                id: "active".to_string(),
+                name: "Active".to_string(),
+                description: None,
+                icon: None,
+                sort_order: 0,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store.add_skill_to_scenario("active", &skill_id).unwrap();
+        for adapter in tool_adapters::enabled_installed_adapters(&store) {
+            if adapter.key != "hermes" {
+                store
+                    .set_scenario_skill_tool_enabled("active", &skill_id, &adapter.key, false)
+                    .unwrap();
+            }
+        }
+        store.set_active_scenario("active").unwrap();
+        let desired = scenario_service::collect_scenario_sync_targets(&store, "active").unwrap();
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0].target, nested_skill);
+        scenario_service::sync_skill_to_active_scenario(&store, "active", &skill_id).unwrap();
+        assert!(!skills_root.join("github").join("SKILL.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(other_skill.join("mine.txt")).unwrap(),
+            "keep this category"
+        );
+        assert_eq!(
+            store.get_all_targets().unwrap()[0].target_path,
+            nested_skill.to_string_lossy()
+        );
+
+        central_repo::set_test_base_dir_override(None);
+    }
+
+    #[test]
+    fn importing_agent_local_skill_survives_reindex_without_joining_scenario() {
         let _guard = central_repo::test_base_dir_lock();
         let temp = tempfile::tempdir().unwrap();
         central_repo::set_test_base_dir_override(Some(temp.path().join("center")));
@@ -744,21 +837,45 @@ mod tests {
             .unwrap();
         store.set_active_scenario("active").unwrap();
 
+        // Start with a non-empty snapshot, as in an already-used library.
+        // An entirely empty snapshot has a separate startup recovery path.
+        let baseline_dir = skills_root.join("baseline");
+        std::fs::create_dir_all(&baseline_dir).unwrap();
+        std::fs::write(baseline_dir.join("SKILL.md"), "# baseline\n").unwrap();
+        import_agent_local_skill_to_center(&store, "test_agent", "baseline").unwrap();
+        sync_metadata::write_all_from_db(&store).unwrap();
+
         import_agent_local_skill_to_center(&store, "test_agent", "local-tool").unwrap();
+        let imported_id = store
+            .get_all_skills()
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.name == "local-tool")
+            .unwrap()
+            .id;
+
+        drop(store);
+        let store = SkillStore::new(&db_path).unwrap();
+        sync_metadata::reindex_from_metadata(&store).unwrap();
 
         let skills = store.get_all_skills().unwrap();
-        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills.len(),
+            2,
+            "workspace upload must survive startup reindex"
+        );
+        let imported = store.get_skill_by_id(&imported_id).unwrap().unwrap();
         // Importing must NOT silently enroll the skill into the active scenario.
         assert!(store
-            .get_scenarios_for_skill(&skills[0].id)
+            .get_scenarios_for_skill(&imported_id)
             .unwrap()
             .is_empty());
         // But it MUST register a managed sync target for the importing agent,
         // pointed at the skill's actual on-disk location, so the workspace
         // recognizes it as managed and shows its delete button.
-        let targets = store.get_all_targets().unwrap();
+        let targets = store.get_targets_for_skill(&imported_id).unwrap();
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].skill_id, skills[0].id);
+        assert_eq!(targets[0].skill_id, imported_id);
         assert_eq!(targets[0].tool, "test_agent");
         assert_eq!(targets[0].target_path, skill_dir.to_string_lossy());
 
@@ -770,7 +887,7 @@ mod tests {
         assert!(meta.file_type().is_symlink());
         assert_eq!(
             std::fs::canonicalize(&skill_dir).unwrap(),
-            std::fs::canonicalize(&skills[0].central_path).unwrap()
+            std::fs::canonicalize(&imported.central_path).unwrap()
         );
 
         central_repo::set_test_base_dir_override(None);
@@ -987,6 +1104,16 @@ mod tests {
         assert_eq!(targets[0].skill_id, "existing-center");
         assert_eq!(targets[0].tool, "test_agent");
         assert_eq!(targets[0].target_path, skill_dir.to_string_lossy());
+
+        let rebuilt = SkillStore::new(&temp.path().join("rebuilt.db")).unwrap();
+        sync_metadata::reindex_from_metadata(&rebuilt).unwrap();
+        assert!(
+            rebuilt
+                .get_skill_by_id("existing-center")
+                .unwrap()
+                .is_some(),
+            "workspace upload of an existing match must persist sync metadata"
+        );
 
         central_repo::set_test_base_dir_override(None);
     }

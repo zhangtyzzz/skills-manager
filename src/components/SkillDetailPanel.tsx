@@ -226,7 +226,7 @@ function SkillDetailPanelContent({
 
   const meta = (
     <>
-      <div className="flex flex-wrap items-center gap-2 text-[12.5px] text-muted">
+      <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted">
         {tools && <SyncDots skill={skill} tools={tools} size="sm" includeOrphan />}
         {skill.tags.length > 0 && (
           <>
@@ -288,7 +288,7 @@ function SkillDetailPanelContent({
                       {item.label}
                     </div>
                     <div
-                      className="mt-0.5 truncate font-mono text-[12.5px] text-secondary"
+                      className="mt-0.5 truncate font-mono text-[13px] text-secondary"
                       title={item.value ?? undefined}
                     >
                       {item.value}

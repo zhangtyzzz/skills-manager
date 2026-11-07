@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { createPortal } from "react-dom";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   FolderOpen,
@@ -25,6 +26,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { useApp } from "../context/AppContext";
+import { useSkillViewMode } from "../hooks/useSkillViewMode";
 import { useMultiSelect } from "../hooks/useMultiSelect";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { MultiSelectToolbar } from "../components/MultiSelectToolbar";
@@ -42,6 +44,8 @@ import { cn } from "../utils";
 import * as api from "../lib/tauri";
 import type { ProjectSkill, ManagedSkill, ProjectAgentTarget } from "../lib/tauri";
 import { getErrorMessage } from "../lib/error";
+import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
+import { useRevealProjectFolder } from "../hooks/useRevealProjectFolder";
 import { AddSkillsSheet } from "../components/AddSkillsSheet";
 const projectLastUsedAgentsKey = (projectId: string) =>
   `project_last_used_export_agents:${projectId}`;
@@ -128,11 +132,12 @@ export function ProjectDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { t } = useTranslation();
+  const { label: revealLabel, reveal: revealProjectFolder } = useRevealProjectFolder();
   const { projects, presets, managedSkills, refreshManagedSkills, refreshPresets, refreshProjects } = useApp();
   const [skills, setSkills] = useState<ProjectSkill[]>([]);
   const [projectAgentTargets, setProjectAgentTargets] = useState<ProjectAgentTarget[]>([]);
   const [loading, setLoading] = useState(true);
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [viewMode, setViewMode] = useSkillViewMode();
   const [filterMode, setFilterMode] = useState<"all" | "enabled" | "disabled">("all");
   const [search, setSearch] = useState("");
   const [tagFilters, setTagFilters] = useState<Set<string>>(new Set());
@@ -149,6 +154,11 @@ export function ProjectDetail() {
   const [togglingAgentTarget, setTogglingAgentTarget] = useState<{ skillKey: string; agent: string } | null>(null);
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ProjectSkillGroup | null>(null);
+  const [unsyncedRemoval, setUnsyncedRemoval] = useState<{
+    details: string[];
+    alsoRemoved: number;
+  } | null>(null);
+  const unsyncedRemovalResolve = useRef<((confirmed: boolean) => void) | null>(null);
   const [batchDeleteConfirm, setBatchDeleteConfirm] = useState(false);
   const [batchTagDialogOpen, setBatchTagDialogOpen] = useState(false);
   const [batchToggling, setBatchToggling] = useState(false);
@@ -291,11 +301,9 @@ export function ProjectDetail() {
   }, [detailSkill, groupedSkills]);
 
   const filtered = useMemo(() => {
+    const query = normalizeSkillSearch(search);
     return groupedSkills.filter((skill) => {
-      const matchesSearch =
-        skill.name.toLowerCase().includes(search.toLowerCase()) ||
-        (skill.description || "").toLowerCase().includes(search.toLowerCase());
-      if (!matchesSearch) return false;
+      if (!skillSearchMatches(query, [skill.name, skill.description])) return false;
       if (tagFilters.size > 0) {
         const wantUntagged = tagFilters.has(UNTAGGED_FILTER);
         const matchUntagged = wantUntagged && skill.tags.length === 0;
@@ -639,6 +647,49 @@ export function ProjectDetail() {
     }
   };
 
+  const settleUnsyncedRemoval = useCallback((confirmed: boolean) => {
+    unsyncedRemovalResolve.current?.(confirmed);
+    unsyncedRemovalResolve.current = null;
+    setUnsyncedRemoval(null);
+  }, []);
+
+  // Leaving the project or the page answers a pending confirmation "no".
+  useEffect(() => () => settleUnsyncedRemoval(false), [id, settleUnsyncedRemoval]);
+
+  // Agent toggles and preset removal delete workspace copies outright. Only
+  // in_sync proves the center holds the same bytes (see
+  // pushSkillToCenterAndAlign), so ask first when any copy is anything else.
+  // The page's scan may predate edits on disk, so re-read the workspace
+  // first; a failed re-read, or a copy missing from it, counts as unsynced.
+  // Not loadSkills: its loading flag swaps the whole grid for a spinner.
+  const confirmUnsyncedRemoval = useCallback(async (variants: ProjectSkill[]) => {
+    if (!id || variants.length === 0) return true;
+    // Read, don't bump: a bump would strand an in-flight loadSkills' spinner.
+    const requestId = skillsRequestRef.current;
+    let fresh: ProjectSkill[] | null = null;
+    try {
+      fresh = await api.getProjectSkills(id);
+      if (skillsRequestRef.current === requestId) setSkills(fresh);
+    } catch (e) {
+      console.error("Failed to re-read project skills before removal:", e);
+    }
+    const unsynced = variants.filter((variant) => {
+      const current = fresh?.find(
+        (skill) => skill.relative_path === variant.relative_path && skill.agent === variant.agent
+      );
+      return current?.sync_status !== "in_sync";
+    });
+    if (unsynced.length === 0) return true;
+    unsyncedRemovalResolve.current?.(false);
+    return new Promise<boolean>((resolve) => {
+      unsyncedRemovalResolve.current = resolve;
+      setUnsyncedRemoval({
+        details: unsynced.map((variant) => `${variant.name} · ${variant.agent_display_name}`),
+        alsoRemoved: variants.length - unsynced.length,
+      });
+    });
+  }, [id]);
+
   const handleToggleDetailAgent = async (skill: ProjectSkillGroup, agentKey: string, enabled: boolean) => {
     if (!id) return;
     if (togglingAgentTarget) return;
@@ -658,6 +709,9 @@ export function ProjectDetail() {
         toast.success(t("project.agentAdded", { agent: displayName, name: skill.name }));
       } else {
         if (!existingVariant) return;
+        // Asked while the toggle is marked pending, so a second click cannot
+        // start another removal.
+        if (!(await confirmUnsyncedRemoval([existingVariant]))) return;
         await api.deleteProjectSkill(id, existingVariant.relative_path, agentKey);
         toast.success(t("project.agentRemoved", { agent: displayName, name: skill.name }));
       }
@@ -893,6 +947,16 @@ export function ProjectDetail() {
     [findProjectPresetVariant, id, t]
   );
 
+  const confirmPresetRemoval = useCallback(
+    (pairs: { skill: ManagedSkill; agentKey: string }[]) =>
+      confirmUnsyncedRemoval(
+        pairs
+          .map(({ skill, agentKey }) => findProjectPresetVariant(skill, agentKey))
+          .filter((variant): variant is ProjectSkill => variant !== null)
+      ),
+    [confirmUnsyncedRemoval, findProjectPresetVariant]
+  );
+
   const handlePresetActionComplete = useCallback(async () => {
     await Promise.all([loadSkills(), refreshProjects()]);
   }, [loadSkills, refreshProjects]);
@@ -905,7 +969,15 @@ export function ProjectDetail() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0 flex-[1_1_260px]">
             <h1 className="app-page-title flex items-center gap-2.5">
-              <FolderOpen className="h-5 w-5 text-accent" />
+              <button
+                type="button"
+                aria-label={revealLabel}
+                title={revealLabel}
+                onClick={() => void revealProjectFolder(project.id)}
+                className="flex cursor-pointer items-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-border"
+              >
+                <FolderOpen className="h-5 w-5 text-accent" />
+              </button>
               {project.name}
               <span className="app-badge">{groupedSkills.length}</span>
             </h1>
@@ -1002,7 +1074,7 @@ export function ProjectDetail() {
                 <div className="absolute right-0 top-full z-20 mt-2 w-72 rounded-md border border-border bg-surface p-3 text-[12px] leading-snug shadow-lg">
                   <button
                     onClick={dismissAddCallout}
-                    className="absolute right-1.5 top-1.5 rounded p-0.5 text-faint hover:text-secondary"
+                    className="absolute right-1.5 top-1.5 rounded-md p-0.5 text-faint hover:text-secondary"
                     aria-label={t("common.close")}
                   >
                     <X className="h-3 w-3" />
@@ -1089,6 +1161,7 @@ export function ProjectDetail() {
             onAddSkill={handleAddPresetSkillToProject}
             onRemoveSkill={handleRemovePresetSkillFromProject}
             onComplete={handlePresetActionComplete}
+            confirmRemove={confirmPresetRemoval}
           />
         )}
       </div>
@@ -1239,7 +1312,7 @@ export function ProjectDetail() {
                             skill.enabledCount === skill.totalCount
                               ? "bg-accent-light shadow-[0_0_0_3px_var(--color-accent-bg)]"
                               : skill.enabledCount > 0
-                                ? "bg-amber-500 shadow-[0_0_0_3px_rgba(245,158,11,0.15)]"
+                                ? "bg-amber-500 ring-[3px] ring-amber-500/15"
                                 : "bg-surface-active"
                           )}
                           title={`${skill.enabledCount}/${skill.totalCount}`}
@@ -1310,7 +1383,7 @@ export function ProjectDetail() {
                           <button
                             onClick={(e) => { e.stopPropagation(); handleUpdateCenter(skill); }}
                             disabled={isUpdatingCenter || isUpdatingProject}
-                            className="rounded px-2 py-1 text-[13px] font-medium text-muted transition-colors outline-none hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
+                            className="rounded-md px-2 py-1 text-[13px] font-medium text-muted transition-colors outline-none hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
                             title={t("project.updateCenter")}
                           >
                             {isUpdatingCenter ? (
@@ -1324,7 +1397,7 @@ export function ProjectDetail() {
                           <button
                             onClick={(e) => { e.stopPropagation(); handleUpdateProject(skill); }}
                             disabled={isUpdatingCenter || isUpdatingProject}
-                            className="rounded px-2 py-1 text-[13px] font-medium text-muted transition-colors outline-none hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
+                            className="rounded-md px-2 py-1 text-[13px] font-medium text-muted transition-colors outline-none hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
                             title={
                               skill.status === "project_newer"
                                 ? t("project.resetFromCenter")
@@ -1354,7 +1427,7 @@ export function ProjectDetail() {
                         ) : null}
                         <button
                           onClick={(e) => { e.stopPropagation(); setDeleteTarget(skill); }}
-                          className="rounded px-2 py-1 text-muted transition-colors outline-none hover:bg-red-500/10 hover:text-red-500"
+                          className="rounded-md px-2 py-1 text-muted transition-colors outline-none hover:bg-red-500/10 hover:text-red-500"
                           title={t("project.deleteSkill")}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
@@ -1390,7 +1463,7 @@ export function ProjectDetail() {
                         skill.enabledCount === skill.totalCount
                           ? "bg-accent-light shadow-[0_0_0_3px_var(--color-accent-bg)]"
                           : skill.enabledCount > 0
-                            ? "bg-amber-500 shadow-[0_0_0_3px_rgba(245,158,11,0.15)]"
+                            ? "bg-amber-500 ring-[3px] ring-amber-500/15"
                             : "bg-surface-active"
                       )}
                       title={`${skill.enabledCount}/${skill.totalCount}`}
@@ -1464,7 +1537,7 @@ export function ProjectDetail() {
                         <button
                           onClick={(e) => { e.stopPropagation(); handleUpdateCenter(skill); }}
                           disabled={isUpdatingCenter || isUpdatingProject}
-                          className="rounded p-0.5 text-muted transition-colors hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
+                          className="rounded-md p-0.5 text-muted transition-colors hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
                           title={t("project.updateCenter")}
                         >
                           {isUpdatingCenter ? (
@@ -1478,7 +1551,7 @@ export function ProjectDetail() {
                         <button
                           onClick={(e) => { e.stopPropagation(); handleUpdateProject(skill); }}
                           disabled={isUpdatingCenter || isUpdatingProject}
-                          className="rounded p-0.5 text-muted transition-colors hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
+                          className="rounded-md p-0.5 text-muted transition-colors hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
                           title={
                             skill.status === "project_newer"
                               ? t("project.resetFromCenter")
@@ -1509,7 +1582,7 @@ export function ProjectDetail() {
                     ) : null}
                     <button
                       onClick={(e) => { e.stopPropagation(); setDeleteTarget(skill); }}
-                      className="shrink-0 rounded p-0.5 text-muted transition-colors hover:bg-red-500/10 hover:text-red-500"
+                      className="shrink-0 rounded-md p-0.5 text-muted transition-colors hover:bg-red-500/10 hover:text-red-500"
                       title={t("project.deleteSkill")}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
@@ -1550,6 +1623,26 @@ export function ProjectDetail() {
         onClose={() => setDeleteTarget(null)}
         onConfirm={handleDeleteSkill}
       />
+
+      {/* Portaled so it covers the detail sheet (its agent toggles land here)
+          and the sheet's Escape handler leaves the key to it. ConfirmDialog
+          calls onClose after onConfirm too; by then the resolver is gone. */}
+      {createPortal(
+        <ConfirmDialog
+          open={!!unsyncedRemoval}
+          title={t("project.removeUnsyncedTitle")}
+          message={
+            unsyncedRemoval && unsyncedRemoval.alsoRemoved > 0
+              ? t("project.removeUnsyncedConfirmWithOthers", { count: unsyncedRemoval.alsoRemoved })
+              : t("project.removeUnsyncedConfirm")
+          }
+          details={unsyncedRemoval?.details}
+          tone="danger"
+          onClose={() => settleUnsyncedRemoval(false)}
+          onConfirm={async () => settleUnsyncedRemoval(true)}
+        />,
+        document.body
+      )}
 
       {/* Batch Delete Confirm Dialog */}
       <ConfirmDialog
@@ -1637,7 +1730,7 @@ function ProjectSkillDetailPanel({
   });
   const meta = (
     <>
-      <div className="flex flex-wrap items-center gap-2 text-[12.5px] text-muted">
+      <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted">
         <ProjectAgentDots
           assignedAgents={getAssignedAgents(skill.variants)}
           targets={getAgentDotTargets(skill.variants).map((t) => ({
@@ -1662,7 +1755,7 @@ function ProjectSkillDetailPanel({
           </>
         )}
       </div>
-      <div className="mt-3 flex items-center gap-4 text-[12.5px] text-muted">
+      <div className="mt-3 flex items-center gap-4 text-[12px] text-muted">
         <div className="flex min-w-0 items-center gap-1.5">
           <FolderOpen className="h-3.5 w-3.5 shrink-0" />
           <span className="font-mono truncate">{skill.primaryVariant.path}</span>

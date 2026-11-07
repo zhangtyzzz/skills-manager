@@ -1,3 +1,4 @@
+use super::git_command::git_command;
 use crate::core::central_repo;
 use crate::core::git_credentials;
 use crate::core::skill_metadata;
@@ -5,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use git2::{Direction, Repository};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -21,18 +23,6 @@ pub const CLONE_TEMP_PREFIX: &str = "skills-manager-clone-";
 
 /// Callback type for reporting clone progress messages to the UI.
 pub type ProgressCallback = Box<dyn Fn(&str) + Send>;
-
-/// Create a `Command` for git that hides the console window on Windows.
-fn git_command() -> Command {
-    #[allow(unused_mut)]
-    let mut cmd = Command::new("git");
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    cmd
-}
 
 #[derive(Debug, Clone)]
 pub struct ParsedGitSource {
@@ -1224,6 +1214,89 @@ pub fn resolve_remote_revision(
     anyhow::bail!("Unable to resolve remote revision for {}", url)
 }
 
+/// Which `(revision, subpath)` pairs hold exactly the same directory at `head`.
+///
+/// A skill installed from a subdirectory of a monorepo would otherwise be
+/// "out of date" after every commit anywhere in that repository (#561). An equal
+/// tree id is not enough on its own: a `.gitattributes` in any directory above
+/// the subpath (line endings, filters) changes the bytes checked out into it
+/// without touching its tree. Only when those match too would an update write
+/// exactly what is already there.
+///
+/// One blobless, depth-1 fetch of `head` and every old revision serves all the
+/// pairs — trees and commits only, measured at ~400 KB for heygen-com/hyperframes.
+/// It goes into a throwaway bare repository, never a cache slot, and the trees
+/// are read with libgit2, which cannot lazily fetch a missing object the way
+/// git would in the partial repository that fetch leaves behind.
+///
+/// A pair whose path is missing, or is not a directory, just stays out of the
+/// result, so the caller reports an update for it. A failure of the comparison
+/// as a whole — the fetch did not go through, the temporary repository could
+/// not be made — is returned instead: whether that still allows reporting an
+/// update depends on why it failed, which is for the caller to judge (#582).
+pub fn unchanged_subtrees(
+    url: &str,
+    head: &str,
+    installed: &HashSet<(String, String)>,
+    proxy_url: Option<&str>,
+) -> Result<HashSet<(String, String)>> {
+    // Revisions reach the command line, so only full object ids get there.
+    let is_object_id = |rev: &str| rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit());
+    let pairs: Vec<&(String, String)> = installed
+        .iter()
+        .filter(|(rev, subpath)| rev != head && is_object_id(rev) && !subpath.is_empty())
+        .collect();
+    if pairs.is_empty() || !is_object_id(head) {
+        return Ok(HashSet::new());
+    }
+
+    let temp =
+        std::env::temp_dir().join(format!("skills-manager-subtree-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<HashSet<(String, String)>> {
+        Repository::init_bare(&temp)?;
+        let mut revs: Vec<&str> = pairs.iter().map(|(rev, _)| rev.as_str()).collect();
+        revs.push(head);
+        revs.sort_unstable();
+        revs.dedup();
+        let mut args = vec!["fetch", "--no-tags", "--depth=1", "--filter=blob:none", url];
+        args.extend(revs);
+        run_git_watched_at(&temp, &args, proxy_url, None, &None)?;
+
+        let repo = Repository::open_bare(&temp)?;
+        // The directory's tree, then the `.gitattributes` entry (or its absence)
+        // of every directory above it, root included. The trees on that path are
+        // all present once the subpath itself resolved, so absent means absent.
+        let checkout_inputs = |rev: &str, subpath: &str| {
+            let commit = repo.find_commit(git2::Oid::from_str(rev).ok()?).ok()?;
+            let root = commit.tree().ok()?;
+            let entry = root.get_path(Path::new(subpath)).ok()?;
+            if entry.kind() != Some(git2::ObjectType::Tree) {
+                return None;
+            }
+            let attributes: Vec<Option<git2::Oid>> = Path::new(subpath)
+                .ancestors()
+                .skip(1)
+                .map(|dir| {
+                    root.get_path(&dir.join(".gitattributes"))
+                        .ok()
+                        .map(|e| e.id())
+                })
+                .collect();
+            Some((entry.id(), attributes))
+        };
+        Ok(pairs
+            .into_iter()
+            .filter(|(rev, subpath)| {
+                let now = checkout_inputs(head, subpath);
+                now.is_some() && now == checkout_inputs(rev, subpath)
+            })
+            .cloned()
+            .collect())
+    })();
+    let _ = std::fs::remove_dir_all(&temp);
+    result
+}
+
 pub fn checkout_revision(repo_dir: &Path, revision: &str) -> Result<()> {
     let status = git_command()
         .arg("-C")
@@ -1258,10 +1331,16 @@ pub fn relative_subpath(repo_dir: &Path, skill_dir: &Path) -> Option<String> {
 fn normalize_url(url: &str) -> (String, Option<String>, Option<String>) {
     let trimmed = url.trim();
 
-    // Already a full URL
-    if trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("git@")
+    // Already a full URL. The prefix check mirrors validate_git_url's
+    // allowlist: ssh:// is permitted there but was missing here (it fell into
+    // the shorthand branch below and came out as
+    // "https://github.com/ssh://..."), and the comparison must be
+    // case-insensitive because validate_git_url lowercases before checking.
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("ssh://")
+        || lower.starts_with("git@")
     {
         if let Some((clone_url, branch, subpath)) = parse_github_tree_url(trimmed) {
             return (clone_url, Some(branch), subpath);
@@ -1269,9 +1348,12 @@ fn normalize_url(url: &str) -> (String, Option<String>, Option<String>) {
         return (trimmed.to_string(), None, None);
     }
 
-    // Shorthand: user/repo
+    // Shorthand: user/repo. Strip one trailing ".git" first — the validator
+    // explicitly accepts "user/repo.git", and appending ".git" unconditionally
+    // would expand it to "https://github.com/user/repo.git.git".
     if trimmed.contains('/') && !trimmed.contains(' ') {
-        return (format!("https://github.com/{}.git", trimmed), None, None);
+        let base = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+        return (format!("https://github.com/{base}.git"), None, None);
     }
 
     (trimmed.to_string(), None, None)
@@ -1335,7 +1417,12 @@ pub fn find_skill_dir(repo_dir: &Path, skill_id: Option<&str>) -> Result<PathBuf
         // of falling through to a container/root — otherwise the installer would
         // copy the entire `skills/` container (or an unrelated root skill) under
         // the requested name, duplicating every skill in the repo. See issue #278.
-        bail!("Skill '{}' not found in {}", id, repo_dir.display());
+        // `repo_dir` is a temp checkout, so its path stays out of the message (#594).
+        bail!(
+            "Skill '{}' was not found in the fetched version of this repository. \
+             Check the source and its subpath.",
+            id
+        );
     }
 
     // No skill id requested — resolve a repo-wide skill location. The fallbacks
@@ -1679,6 +1766,37 @@ mod tests {
         assert_eq!(parsed.branch, None);
     }
 
+    #[test]
+    fn parses_shorthand_url_with_git_suffix() {
+        // validate_git_url explicitly accepts "user/repo.git"; it must not
+        // expand to "https://github.com/acme/skills.git.git".
+        let parsed = parse_git_source("acme/skills.git");
+        assert_eq!(parsed.clone_url, "https://github.com/acme/skills.git");
+        assert_eq!(parsed.branch, None);
+        assert_eq!(parsed.subpath, None);
+    }
+
+    #[test]
+    fn parses_ssh_scheme_url() {
+        // validate_git_url permits ssh://, so it must pass through instead of
+        // falling into the shorthand branch.
+        let parsed = parse_git_source("ssh://git@github.com/acme/skills.git");
+        assert_eq!(parsed.clone_url, "ssh://git@github.com/acme/skills.git");
+        assert_eq!(parsed.branch, None);
+        assert_eq!(parsed.subpath, None);
+    }
+
+    #[test]
+    fn scheme_comparison_is_case_insensitive() {
+        // validate_git_url lowercases before checking schemes, so an
+        // uppercase scheme is legal input and must not hit the shorthand
+        // branch either.
+        let parsed = parse_git_source("HTTPS://GitHub.com/acme/skills");
+        assert_eq!(parsed.clone_url, "HTTPS://GitHub.com/acme/skills");
+        assert_eq!(parsed.branch, None);
+        assert_eq!(parsed.subpath, None);
+    }
+
     // ── find_skill_dir ──
 
     #[test]
@@ -1808,6 +1926,25 @@ mod tests {
             missing.is_err(),
             "expected an error for missing skill id, got {:?}",
             missing
+        );
+    }
+
+    #[test]
+    fn missing_skill_error_names_the_skill_not_the_temp_checkout() {
+        // The checkout is a throwaway temp directory; its path tells the user
+        // nothing and reads like an internal failure (#594).
+        let tmp = tempdir().unwrap();
+        let skill = tmp.path().join("skills").join("kept");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: kept\n---").unwrap();
+
+        let message = find_skill_dir(tmp.path(), Some("moved-away"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("'moved-away'"), "{message}");
+        assert!(
+            !message.contains(&tmp.path().display().to_string()),
+            "{message}"
         );
     }
 

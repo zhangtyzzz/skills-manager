@@ -127,7 +127,7 @@ function AgentToggle({
         displayName={item.displayName}
         className="h-5 w-5 rounded-[4px]"
       />
-      <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-secondary">
+      <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-secondary">
         {item.displayName}
       </span>
       {item.badgeLabel && (

@@ -20,8 +20,9 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import { cn } from "../utils";
+import { cn, compactHomePath } from "../utils";
 import { useApp } from "../context/AppContext";
+import { useSkillViewMode } from "../hooks/useSkillViewMode";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { PresetBar } from "../components/PresetBar";
 import { AgentIcon } from "../components/AgentIcon";
@@ -31,15 +32,12 @@ import { DocumentDiffViewer } from "../components/DocumentDiffViewer";
 import * as api from "../lib/tauri";
 import type { ManagedSkill, ProjectSkill } from "../lib/tauri";
 import { getErrorMessage } from "../lib/error";
+import { normalizeSkillSearch, skillSearchMatches } from "../lib/skillSearch";
 import { getTagActiveColor, getTagColor, pruneStaleTagFilters, UNTAGGED_FILTER } from "../lib/skillTags";
 import { AddSkillsSheet } from "../components/AddSkillsSheet";
 import { useMultiSelect } from "../hooks/useMultiSelect";
 import { MultiSelectToolbar } from "../components/MultiSelectToolbar";
 import type { WorkspaceConfig } from "./workspaceConfigs";
-
-function compactHomePath(path: string) {
-  return path.replace(/^\/Users\/[^/]+/, "~");
-}
 
 interface WorkspaceSkillCardTag {
   label: string;
@@ -245,7 +243,7 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
   const { t } = useTranslation();
   const { tools, managedSkills, presets, refreshManagedSkills, refreshTools } = useApp();
 
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [viewMode, setViewMode] = useSkillViewMode();
   const [search, setSearch] = useState("");
   const [tagFilters, setTagFilters] = useState<Set<string>>(new Set());
   const [addDialogOpen, setAddDialogOpen] = useState(false);
@@ -440,16 +438,10 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
   }, [allLocalTags, localSkills]);
 
   const visibleLocalSkills = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    const q = normalizeSkillSearch(search);
     return localSkills
       .filter((skill) => {
-        if (q) {
-          const matchesQuery =
-            skill.name.toLowerCase().includes(q) ||
-            skill.dir_name.toLowerCase().includes(q) ||
-            (skill.description || "").toLowerCase().includes(q);
-          if (!matchesQuery) return false;
-        }
+        if (!skillSearchMatches(q, [skill.name, skill.dir_name, skill.description])) return false;
         if (tagFilters.size > 0) {
           const wantUntagged = tagFilters.has(UNTAGGED_FILTER);
           const matchUntagged = wantUntagged && skill.tags.length === 0;
@@ -729,8 +721,8 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
     const canDeleteLocal = !isManaged && skill.sync_status === "project_only";
     const removing = removingLocalSkillId === skill.relative_path;
     const buttonClassName = variant === "grid"
-      ? "rounded px-2 py-1 text-[13px] font-medium text-muted transition-colors outline-none hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
-      : "rounded p-0.5 text-muted transition-colors hover:bg-surface-hover hover:text-secondary disabled:opacity-50";
+      ? "rounded-md px-2 py-1 text-[13px] font-medium text-muted transition-colors outline-none hover:bg-surface-hover hover:text-secondary disabled:opacity-50"
+      : "rounded-md p-0.5 text-muted transition-colors hover:bg-surface-hover hover:text-secondary disabled:opacity-50";
 
     if (isInSync && !isManaged) return null;
 

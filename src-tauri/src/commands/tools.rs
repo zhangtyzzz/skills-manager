@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,16 +40,40 @@ fn sync_active_scenario_to_tool(store: &SkillStore, tool_key: &str) {
 
 /// Remove all synced skill files and target records for a given tool.
 fn unsync_all_for_tool(store: &SkillStore, tool_key: &str) {
+    release_tool_targets(store, tool_key, None);
+}
+
+/// Drop every target record of `tool_key`. With `new_dir`, the tool has just
+/// moved there: deployments outside it sit at a path the tool no longer reads
+/// and are released (copies moved into the library) rather than removed. Without it, the user is
+/// taking the skills away from the tool, so they are removed.
+fn release_tool_targets(store: &SkillStore, tool_key: &str, new_dir: Option<&Path>) {
     let targets = store.get_all_targets().unwrap_or_default();
     for target in targets.iter().filter(|t| t.tool == tool_key) {
-        sync_engine::remove_target(&PathBuf::from(&target.target_path)).ok();
+        // Tools can share one skills directory; another tool's live
+        // deployment at this exact path is not ours to remove.
+        let still_referenced = targets
+            .iter()
+            .any(|other| other.tool != tool_key && other.target_path == target.target_path);
+        if !still_referenced {
+            let path = PathBuf::from(&target.target_path);
+            match new_dir {
+                Some(dir) if path.parent() != Some(dir) => {
+                    scenario_service::release_abandoned_target(&path, &target.mode, tool_key);
+                }
+                _ => {
+                    sync_engine::remove_recorded_target_or_warn(&path, &target.mode);
+                }
+            }
+        }
         store.delete_target(&target.skill_id, tool_key).ok();
     }
 }
 
 fn reconcile_tool_sync_after_path_change(store: &SkillStore, tool_key: &str) {
-    // Remove existing synced artifacts/records (old path), then re-sync to current adapter path.
-    unsync_all_for_tool(store, tool_key);
+    // Release the deployments at the old path, then re-sync to the current one.
+    let new_dir = tool_adapters::find_adapter_with_store(store, tool_key).map(|a| a.skills_dir());
+    release_tool_targets(store, tool_key, new_dir.as_deref());
     let disabled = get_disabled_tools(store);
     if !disabled.contains(&tool_key.to_string()) {
         sync_active_scenario_to_tool(store, tool_key);
@@ -382,38 +406,55 @@ pub async fn add_custom_tool(
 ) -> Result<(), AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let key = key.trim().to_string();
-        let display_name = display_name.trim().to_string();
-        let skills_dir = normalize_skills_dir_input(&skills_dir)?;
-        let project_relative_skills_dir = normalize_project_relative_skills_dir_input(
-            project_relative_skills_dir.as_deref().unwrap_or_default(),
-        )?;
-        if key.is_empty() || display_name.is_empty() || skills_dir.is_empty() {
-            return Err(AppError::invalid_input(
-                "Agent key, name and skills path are required",
-            ));
-        }
-
-        // Validate key uniqueness
-        let all = tool_adapters::all_tool_adapters(&store);
-        if all.iter().any(|a| a.key == key) {
-            return Err(AppError::invalid_input(format!(
-                "Agent key \"{key}\" already exists"
-            )));
-        }
-        let mut customs = get_custom_tools(&store);
-        customs.push(CustomToolDef {
-            key: key.clone(),
-            display_name,
-            skills_dir,
-            project_relative_skills_dir,
-            category: Default::default(),
-        });
-        set_custom_tools(&store, &customs)?;
-        reconcile_tool_sync_after_path_change(&store, &key);
-        Ok(())
+        add_custom_tool_internal(
+            &store,
+            &key,
+            &display_name,
+            &skills_dir,
+            project_relative_skills_dir.as_deref(),
+        )
     })
     .await?
+}
+
+/// Shared by the app and the CLI (`agents add-custom`, #501).
+pub fn add_custom_tool_internal(
+    store: &SkillStore,
+    key: &str,
+    display_name: &str,
+    skills_dir: &str,
+    project_relative_skills_dir: Option<&str>,
+) -> Result<(), AppError> {
+    let key = key.trim().to_string();
+    let display_name = display_name.trim().to_string();
+    let skills_dir = normalize_skills_dir_input(skills_dir)?;
+    let project_relative_skills_dir = normalize_project_relative_skills_dir_input(
+        project_relative_skills_dir.unwrap_or_default(),
+    )?;
+    if key.is_empty() || display_name.is_empty() || skills_dir.is_empty() {
+        return Err(AppError::invalid_input(
+            "Agent key, name and skills path are required",
+        ));
+    }
+
+    // Validate key uniqueness
+    let all = tool_adapters::all_tool_adapters(store);
+    if all.iter().any(|a| a.key == key) {
+        return Err(AppError::invalid_input(format!(
+            "Agent key \"{key}\" already exists"
+        )));
+    }
+    let mut customs = get_custom_tools(store);
+    customs.push(CustomToolDef {
+        key: key.clone(),
+        display_name,
+        skills_dir,
+        project_relative_skills_dir,
+        category: Default::default(),
+    });
+    set_custom_tools(store, &customs)?;
+    reconcile_tool_sync_after_path_change(store, &key);
+    Ok(())
 }
 
 #[tauri::command]
@@ -424,11 +465,7 @@ pub async fn remove_custom_tool(
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         // Remove synced targets for this tool
-        let targets = store.get_all_targets().unwrap_or_default();
-        for target in targets.iter().filter(|t| t.tool == key) {
-            crate::core::sync_engine::remove_target(&PathBuf::from(&target.target_path)).ok();
-            store.delete_target(&target.skill_id, &key).ok();
-        }
+        unsync_all_for_tool(&store, &key);
         // Remove from custom_tools list
         let mut customs = get_custom_tools(&store);
         customs.retain(|c| c.key != key);
@@ -452,7 +489,8 @@ pub fn migrate_legacy_tool_keys(store: &SkillStore) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::skill_store::{ScenarioRecord, SkillRecord};
+    use crate::core::central_repo;
+    use crate::core::skill_store::{ScenarioRecord, SkillRecord, SkillTargetRecord};
     use std::fs;
     use tempfile::tempdir;
 
@@ -648,5 +686,495 @@ mod tests {
         assert!(targets.iter().any(|target| {
             target.skill_id == "second" && target.target_path.ends_with("skill123-2")
         }));
+    }
+
+    /// Insert a minimal skill row (the `skill_targets` foreign key needs it)
+    /// plus one target row pointing at `target_path`.
+    fn insert_skill_and_target(
+        store: &SkillStore,
+        target_path: &std::path::Path,
+        tool: &str,
+        mode: &str,
+    ) {
+        store
+            .insert_skill(&SkillRecord {
+                id: "s1".to_string(),
+                name: "my-skill".to_string(),
+                description: None,
+                source_type: "import".to_string(),
+                source_ref: None,
+                source_ref_resolved: None,
+                source_subpath: None,
+                source_branch: None,
+                source_revision: None,
+                remote_revision: None,
+                central_path: "unused".to_string(),
+                content_hash: None,
+                enabled: true,
+                created_at: 1,
+                updated_at: 1,
+                status: "ok".to_string(),
+                update_status: "local_only".to_string(),
+                last_checked_at: None,
+                last_check_error: None,
+            })
+            .unwrap();
+        store
+            .insert_target(&SkillTargetRecord {
+                id: "t1".to_string(),
+                skill_id: "s1".to_string(),
+                tool: tool.to_string(),
+                target_path: target_path.to_string_lossy().to_string(),
+                mode: mode.to_string(),
+                status: "ok".to_string(),
+                synced_at: Some(1),
+                last_error: None,
+                source_hash: None,
+            })
+            .unwrap();
+    }
+
+    /// #435: a `skill_targets` row is a statement about the past. When the
+    /// user replaced our symlink with a real directory of their own,
+    /// disabling the tool must preserve it — the row only authorizes
+    /// removing what still looks like what we deployed.
+    #[test]
+    fn disabling_a_tool_preserves_user_content_that_replaced_a_recorded_link() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
+        let target = tmp.path().join("agent-skills").join("my-skill");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("mine.txt"), "DO_NOT_OVERWRITE").unwrap();
+        insert_skill_and_target(&store, &target, "test_agent", "symlink");
+
+        unsync_all_for_tool(&store, "test_agent");
+
+        assert_eq!(
+            fs::read_to_string(target.join("mine.txt")).unwrap(),
+            "DO_NOT_OVERWRITE",
+            "the user's directory must survive the disable"
+        );
+        assert!(
+            store.get_targets_for_skill("s1").unwrap().is_empty(),
+            "the stale record must not survive the disable"
+        );
+    }
+
+    /// A copy-mode row still vouches for a real directory — that is what a
+    /// copy deployment is — so disabling the tool removes it. Guards #435's
+    /// fix against overcorrecting into refusing every real directory.
+    #[test]
+    fn disabling_a_tool_still_removes_a_recorded_copy_deployment() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
+        let target = tmp.path().join("agent-skills").join("my-skill");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "---\nname: my-skill\n---\n").unwrap();
+        insert_skill_and_target(&store, &target, "test_agent", "copy");
+
+        unsync_all_for_tool(&store, "test_agent");
+
+        assert!(
+            !target.exists(),
+            "a recorded copy deployment is ours to remove"
+        );
+        assert!(store.get_targets_for_skill("s1").unwrap().is_empty());
+    }
+
+    /// Two tools resolving to one skills directory share the deployment at a
+    /// path. Disabling one must leave the other's copy in place.
+    #[test]
+    fn disabling_a_tool_keeps_a_deployment_another_tool_shares() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
+        let target = tmp.path().join("agent-skills").join("my-skill");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "---\nname: my-skill\n---\n").unwrap();
+        insert_skill_and_target(&store, &target, "agent_a", "copy");
+        store
+            .insert_target(&SkillTargetRecord {
+                id: "t2".to_string(),
+                skill_id: "s1".to_string(),
+                tool: "agent_b".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+                mode: "copy".to_string(),
+                status: "ok".to_string(),
+                synced_at: Some(1),
+                last_error: None,
+                source_hash: None,
+            })
+            .unwrap();
+
+        unsync_all_for_tool(&store, "agent_a");
+
+        assert!(target.exists(), "agent_b still deploys this path");
+        let remaining = store.get_targets_for_skill("s1").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].tool, "agent_b");
+    }
+
+    /// One skill in the active preset, deployed to `old_base` with `mode`. A
+    /// copy deployment also gets a file the user added to it there. The
+    /// library lives in the temp dir, since kept copies are moved into it.
+    struct MovedTool {
+        _tmp: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        store: SkillStore,
+        old_base: PathBuf,
+        old_copy: PathBuf,
+        new_base: PathBuf,
+        kept_root: PathBuf,
+    }
+
+    impl Drop for MovedTool {
+        fn drop(&mut self) {
+            central_repo::set_test_base_dir_override(None);
+        }
+    }
+
+    fn deploy_before_the_move(mode: &str) -> MovedTool {
+        let lock = central_repo::test_base_dir_lock();
+        let tmp = tempdir().unwrap();
+        central_repo::set_test_base_dir_override(Some(tmp.path().join("library")));
+        let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
+        let source_base = tmp.path().join("central");
+        let old_base = tmp.path().join("old-skills");
+        let new_base = tmp.path().join("new-skills");
+        for dir in [&source_base, &old_base, &new_base] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        configure_single_custom_tool(&store, &old_base);
+        store.set_setting("sync_mode", mode).unwrap();
+        store
+            .insert_scenario(&sample_scenario("active", "Active"))
+            .unwrap();
+        store.set_active_scenario("active").unwrap();
+        let source = write_skill_dir(&source_base, "skill-a", "library");
+        store
+            .insert_skill(&sample_skill("a", "skill-a", &source))
+            .unwrap();
+        store.add_skill_to_scenario("active", "a").unwrap();
+        sync_active_scenario_to_tool(&store, "test_agent");
+
+        let old_copy = old_base.join("skill-a");
+        if mode == "copy" {
+            fs::write(old_copy.join("notes.md"), "edited by the user").unwrap();
+        }
+        let kept_root = tmp.path().join("library/kept-copies/test_agent");
+        MovedTool {
+            _tmp: tmp,
+            _lock: lock,
+            store,
+            old_base,
+            old_copy,
+            new_base,
+            kept_root,
+        }
+    }
+
+    /// The tool's directory changes underneath the records, as when an app
+    /// update moves a built-in adapter (#593), without the settings-page
+    /// reconcile running.
+    fn move_tool_without_reconcile(moved: &MovedTool, mode: &str) {
+        configure_single_custom_tool(&moved.store, &moved.new_base);
+        moved.store.set_setting("sync_mode", mode).unwrap();
+    }
+
+    fn assert_kept_and_redeployed(moved: &MovedTool) {
+        assert_eq!(
+            fs::read_to_string(moved.kept_root.join("skill-a/notes.md")).unwrap(),
+            "edited by the user",
+            "the edited copy was not kept in the library"
+        );
+        // Moved out, not left behind: another agent may read the old
+        // directory, and moving back must not find it in the way.
+        assert!(
+            !moved.old_copy.exists(),
+            "the copy was left at the old path"
+        );
+        assert_eq!(
+            fs::read_to_string(moved.new_base.join("skill-a/unique.txt")).unwrap(),
+            "library",
+            "the skill was not deployed to the new path"
+        );
+        let targets = moved.store.get_targets_for_skill("a").unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            PathBuf::from(&targets[0].target_path),
+            moved.new_base.join("skill-a")
+        );
+    }
+
+    /// #593: changing a tool's skills directory in Settings must not delete
+    /// the copy left at the old path; the user may have edited it there.
+    #[test]
+    fn moving_a_tool_keeps_an_edited_copy_at_the_old_path() {
+        let moved = deploy_before_the_move("copy");
+
+        apply_tool_skills_dir(
+            &moved.store,
+            "test_agent",
+            &moved.new_base.to_string_lossy(),
+        )
+        .unwrap();
+
+        assert_kept_and_redeployed(&moved);
+    }
+
+    /// Only copies are kept. A link at the old path carries no data of its
+    /// own, so it is still removed.
+    #[test]
+    fn moving_a_tool_still_removes_a_link_at_the_old_path() {
+        let moved = deploy_before_the_move("symlink");
+        assert!(
+            fs::symlink_metadata(&moved.old_copy)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "fixture: expected a link deployment"
+        );
+
+        apply_tool_skills_dir(
+            &moved.store,
+            "test_agent",
+            &moved.new_base.to_string_lossy(),
+        )
+        .unwrap();
+
+        assert!(
+            fs::symlink_metadata(&moved.old_copy).is_err(),
+            "the link at the old path was left behind"
+        );
+        assert!(moved.new_base.join("skill-a/unique.txt").exists());
+    }
+
+    /// The next full sync after the adapter moved (`sync_desired_targets`).
+    #[test]
+    fn a_full_sync_after_the_tool_moved_keeps_the_old_copy() {
+        let moved = deploy_before_the_move("copy");
+        move_tool_without_reconcile(&moved, "copy");
+
+        scenario_service::sync_scenario_skills(&moved.store, "active").unwrap();
+
+        assert_kept_and_redeployed(&moved);
+    }
+
+    /// Re-syncing one skill after the adapter moved
+    /// (`sync_skill_to_active_scenario`).
+    #[test]
+    fn a_single_skill_sync_after_the_tool_moved_keeps_the_old_copy() {
+        let moved = deploy_before_the_move("copy");
+        move_tool_without_reconcile(&moved, "copy");
+
+        scenario_service::sync_skill_to_active_scenario(&moved.store, "active", "a").unwrap();
+
+        assert_kept_and_redeployed(&moved);
+    }
+
+    /// Switching presets after the adapter moved: a skill the new preset still
+    /// deploys keeps its old copy, but one the new preset drops is removed,
+    /// because the user is taking it away from the tool.
+    #[test]
+    fn switching_presets_after_the_tool_moved_keeps_only_skills_still_deployed() {
+        let moved = deploy_before_the_move("copy");
+        let source_b = write_skill_dir(&moved._tmp.path().join("central"), "skill-b", "b");
+        moved
+            .store
+            .insert_skill(&sample_skill("b", "skill-b", &source_b))
+            .unwrap();
+        moved.store.add_skill_to_scenario("active", "b").unwrap();
+        sync_active_scenario_to_tool(&moved.store, "test_agent");
+        // Re-syncing at the same path replaces the copy, so the user's edit
+        // has to come after it. That replacement is a separate, known gap.
+        fs::write(moved.old_copy.join("notes.md"), "edited by the user").unwrap();
+        let old_b = moved.old_copy.with_file_name("skill-b");
+        assert!(old_b.join("unique.txt").exists(), "fixture: b not deployed");
+
+        moved
+            .store
+            .insert_scenario(&sample_scenario("next", "Next"))
+            .unwrap();
+        moved.store.add_skill_to_scenario("next", "a").unwrap();
+        move_tool_without_reconcile(&moved, "copy");
+
+        scenario_service::apply_scenario_to_default(&moved.store, "next").unwrap();
+
+        assert_kept_and_redeployed(&moved);
+        assert!(
+            !old_b.exists(),
+            "a skill the new preset drops must be removed"
+        );
+    }
+
+    /// Moving a tool and then moving it back: the first move must not leave
+    /// an unrecorded directory at the original path, or the way back refuses
+    /// to deploy there while the save reports success.
+    #[test]
+    fn moving_a_tool_away_and_back_redeploys_at_the_original_path() {
+        let moved = deploy_before_the_move("copy");
+        let new_base = moved.new_base.to_string_lossy().to_string();
+        let old_base = moved.old_base.to_string_lossy().to_string();
+
+        apply_tool_skills_dir(&moved.store, "test_agent", &new_base).unwrap();
+        apply_tool_skills_dir(&moved.store, "test_agent", &old_base).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(moved.old_copy.join("unique.txt")).unwrap(),
+            "library",
+            "the skill was not redeployed at the original path"
+        );
+        let targets = moved.store.get_targets_for_skill("a").unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(PathBuf::from(&targets[0].target_path), moved.old_copy);
+        assert_eq!(
+            fs::read_to_string(moved.kept_root.join("skill-a/notes.md")).unwrap(),
+            "edited by the user"
+        );
+    }
+
+    /// A copy deployed from the library's current content, with the hash
+    /// recorded as a real install records it, then edited in the agent's folder.
+    fn edited_copy() -> MovedTool {
+        let deployed = deploy_before_the_move("copy");
+        set_library_hash(&deployed);
+        sync_active_scenario_to_tool(&deployed.store, "test_agent");
+        fs::write(
+            deployed.old_copy.join("SKILL.md"),
+            "edited in the agent's copy",
+        )
+        .unwrap();
+        deployed
+    }
+
+    fn set_library_hash(deployed: &MovedTool) {
+        let skill = deployed.store.get_skill_by_id("a").unwrap().unwrap();
+        let hash =
+            crate::core::content_hash::hash_directory(Path::new(&skill.central_path)).unwrap();
+        deployed
+            .store
+            .update_skill_after_install("a", "skill-a", None, None, None, Some(&hash), "local_only")
+            .unwrap();
+    }
+
+    fn copy_still_edited(deployed: &MovedTool) -> bool {
+        fs::read_to_string(deployed.old_copy.join("SKILL.md")).unwrap()
+            == "edited in the agent's copy"
+    }
+
+    type Resync = fn(&SkillStore) -> Result<(), AppError>;
+
+    /// Every way the app re-syncs one skill to an agent that already has it.
+    const RESYNCS: [(&str, Resync); 5] = [
+        ("full sync", |store| {
+            scenario_service::sync_scenario_skills(store, "active").map(drop)
+        }),
+        ("single skill to the active preset", |store| {
+            scenario_service::sync_skill_to_active_scenario(store, "active", "a")
+        }),
+        ("single skill to one agent", |store| {
+            scenario_service::sync_single_skill_to_tool(
+                store,
+                "a",
+                "test_agent",
+                scenario_service::DeployIntent::Managed,
+            )
+        }),
+        ("batch deploy", |store| {
+            scenario_service::apply_skills_to_tools(
+                store,
+                &["a".to_string()],
+                &["test_agent".to_string()],
+                scenario_service::BatchApplyMode::Add,
+            )
+        }),
+        ("copies after an update", |store| {
+            crate::commands::skills::resync_copy_targets(store, "a")
+        }),
+    ];
+
+    /// Applying a preset from the PresetBar, a batch deploy or the sync after
+    /// an install rewrote the copy and deleted edits made in it, although the
+    /// library had not changed (F1's third case).
+    #[test]
+    fn a_resync_leaves_an_edited_copy_alone_while_the_library_is_unchanged() {
+        for (name, resync) in RESYNCS {
+            let deployed = edited_copy();
+            resync(&deployed.store).unwrap();
+            assert!(
+                copy_still_edited(&deployed),
+                "{name} overwrote the edited copy"
+            );
+        }
+    }
+
+    /// The user swapped the copy for a link to the library. That serves the
+    /// same content, so the link is left as it is, as `main` did.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_the_library_in_place_of_the_copy_is_left_alone() {
+        for (name, resync) in RESYNCS {
+            let deployed = edited_copy();
+            let skill = deployed.store.get_skill_by_id("a").unwrap().unwrap();
+            fs::remove_dir_all(&deployed.old_copy).unwrap();
+            std::os::unix::fs::symlink(&skill.central_path, &deployed.old_copy).unwrap();
+
+            resync(&deployed.store).unwrap();
+
+            assert!(
+                fs::symlink_metadata(&deployed.old_copy)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name} replaced the user's link with a copy"
+            );
+        }
+    }
+
+    /// A copy is current only while it is still a directory (or a link to the
+    /// library). A file the user put in its place stays, and deploying over it
+    /// is refused.
+    #[test]
+    fn a_file_in_place_of_the_copy_is_not_taken_for_a_current_copy() {
+        for (name, resync) in RESYNCS {
+            let deployed = edited_copy();
+            fs::remove_dir_all(&deployed.old_copy).unwrap();
+            fs::write(&deployed.old_copy, "the user's file").unwrap();
+
+            let result = resync(&deployed.store);
+
+            assert_eq!(
+                fs::read_to_string(&deployed.old_copy).unwrap(),
+                "the user's file",
+                "{name} replaced the user's file"
+            );
+            if name == "single skill to one agent" {
+                assert!(
+                    result.is_err(),
+                    "{name} reported success over the user's file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_resync_still_delivers_a_library_change() {
+        for (name, resync) in RESYNCS {
+            let deployed = edited_copy();
+            let skill = deployed.store.get_skill_by_id("a").unwrap().unwrap();
+            fs::write(
+                Path::new(&skill.central_path).join("unique.txt"),
+                "library v2",
+            )
+            .unwrap();
+            set_library_hash(&deployed);
+
+            resync(&deployed.store).unwrap();
+
+            assert_eq!(
+                fs::read_to_string(deployed.old_copy.join("unique.txt")).unwrap(),
+                "library v2",
+                "{name} did not deliver the library change"
+            );
+        }
     }
 }

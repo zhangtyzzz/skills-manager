@@ -13,9 +13,11 @@
 </p>
 
 <p align="center">
-  🎬 <a href="https://www.bilibili.com/video/BV1845F6REUu/">视频介绍（Bilibili）</a>
+  🎬 <a href="https://www.bilibili.com/video/BV1cdpc6PExG/">1.5 分钟介绍（Bilibili）</a>
   &nbsp;·&nbsp;
-  <a href="https://www.youtube.com/watch?v=wfbCrfNASVU">Video intro (YouTube)</a>
+  <a href="https://www.bilibili.com/video/BV1845F6REUu/">完整功能演示（9 分钟）</a>
+  &nbsp;·&nbsp;
+  <a href="https://www.youtube.com/watch?v=DJ9RIX8nbow">Video intro (YouTube)</a>
 </p>
 
 <p align="center">
@@ -93,6 +95,13 @@ brew install --cask skills-manager
 
 从 [最新 Release](https://github.com/xingkongliang/skills-manager/releases/latest) 下载对应平台的安装包：Windows 为 `.exe` 或 `.msi`，Linux 为 `.AppImage`、`.deb` 或 `.rpm`（提供 x64 和 arm64）。
 
+Windows 也可以用 [Scoop](https://scoop.sh) 安装：
+
+```powershell
+scoop bucket add extras
+scoop install extras/skills-manager
+```
+
 所有安装包都自带 CLI，位置见 [二进制放在哪](#二进制放在哪)。
 
 ## 快速上手
@@ -144,9 +153,9 @@ npx skills add xingkongliang/skills-manager
 
 ## 支持的工具
 
-开箱支持 54 个 Agent，包括：
+开箱支持 56 个 Agent，包括：
 
-Claude Code · Codex · Cursor · GitHub Copilot · Gemini CLI · GitLab Duo · OpenCode · OpenClaw · Hermes Agent · OpenHands · Cline · Goose · Windsurf · Continue · Grok · Antigravity · Qwen Code · ZCode · Crush · Kilo Code · Roo Code · Amp · Kiro CLI · Droid · TRAE IDE · Warp · Qoder · CodeBuddy
+Claude Code · Codex · Cursor · GitHub Copilot · Gemini CLI · GitLab Duo · OpenCode · OpenClaw · Hermes Agent · OpenHands · Cline · Goose · Windsurf · Continue · Grok · Antigravity · Qwen Code · ZCode · Crush · Kilo Code · Roo Code · Amp · Kiro CLI · Droid · TRAE IDE · Warp · Qoder · CodeBuddy · MiniMax Code
 
 **设置**页会列出全部，并优先展示在你机器上检测到的那些。你也可以在那里添加自定义工具，以相同方式管理其 Skills。
 
@@ -199,11 +208,11 @@ npm run cli -- skills update --all
 npm run cli -- skills adopt ~/.claude/skills --dry-run
 ```
 
-任何命令组或子命令加 `--help` 都会打印完整用法——下面几个组能做的远不止上面这些例子，破坏性命令都支持 `--dry-run`（`remove` 还强制要求 `--yes`）。
+任何命令组或子命令加 `--help` 都会打印完整用法——下面几个组能做的远不止上面这些例子。部分命令支持 `--dry-run`，包括 `skills deploy/undeploy/sync/remove/adopt` 和 `presets deploy/undeploy/delete`；使用前请查看对应子命令的帮助。实际执行 `skills remove` 还需要 `--yes`。
 
 可用命令分组：
 - `repo`：查看或修改当前 base directory
-- `agents`（兼容别名 `tools`）：列出 Agent，并全局启用或禁用 Agent
+- `agents`（兼容别名 `tools`）：列出 Agent、全局启用或禁用 Agent，以及添加自定义 Agent（`add-custom`）
 - `skills`：管理中央库、标签，以及 skill 在各 Agent 中的真实部署
 - `presets`：创建、修改、删除、整理、部署或撤下 Preset
 - `git`：操作 git 管理的 `skills/` 仓库（`clone`、`pull`、`push`、`commit`、`versions`、`restore`）
@@ -214,6 +223,20 @@ npm run cli -- skills adopt ~/.claude/skills --dry-run
 
 ```bash
 npm run -s cli -- --skills-root /path/to/my-skills --json skills list
+```
+
+#### Agent 在 WSL 里
+
+Windows 版应用无法在 WSL 里建链接，只能复制。如果你的 agent 都装在 WSL 里，请在 WSL 内直接使用 Linux 版 CLI：它在 WSL 里维护自己的技能库，并用真正的软链接部署：
+
+```bash
+mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/skills-manager-cli \
+  https://github.com/xingkongliang/skills-manager/releases/latest/download/skills-manager-cli-Linux-x64
+chmod +x ~/.local/bin/skills-manager-cli
+export PATH="$HOME/.local/bin:$PATH"
+skills-manager-cli agents add-custom hermes-work --path ~/.hermes/profiles/work/skills
+skills-manager-cli skills install ./my-skill
+skills-manager-cli skills deploy my-skill --agent hermes-work
 ```
 
 #### 二进制放在哪

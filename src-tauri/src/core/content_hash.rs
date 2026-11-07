@@ -15,6 +15,15 @@ fn is_ignored(name: &str) -> bool {
     IGNORED.contains(&name) || name.ends_with(".pyc")
 }
 
+/// Dependency installs (`npm install`, a Python venv) inside a skill. They stay
+/// in the content hash — a directory that holds them is not interchangeable
+/// with one that doesn't, and repairs that replace a directory on hash
+/// equality must keep seeing the difference. Only the update-check tiebreaker
+/// ([`hash_directory_eol_insensitive`]) looks past them (#502). The cost is
+/// that an edit to a file a skill keeps under a directory with one of these
+/// names goes unnoticed by that tiebreaker — nobody authors skill files there.
+const DEPENDENCY_DIRS: &[&str] = &["node_modules", ".venv", "venv"];
+
 /// One file in a skill's canonical "content scope" — the set of files that
 /// both [`hash_directory`] and the source-diff command operate on. Sharing
 /// this enumeration keeps the update badge and the diff from ever
@@ -31,6 +40,40 @@ pub struct ContentEntry {
     /// so callers don't need a second `metadata()` syscall (or a separate
     /// recursive walk) just to learn when the content last changed.
     pub modified_ms: Option<i64>,
+    /// Size and change times from the same metadata, for [`stamp_entries`].
+    /// `None` when the walk could not read them.
+    stat: Option<FileStat>,
+}
+
+/// What a stamp records about one file instead of reading it.
+#[derive(Clone, Copy)]
+struct FileStat {
+    len: u64,
+    modified_ns: u128,
+    /// The inode change time on unix, which no tool can set back the way it
+    /// can the modification time. Zero elsewhere.
+    changed_ns: i128,
+}
+
+fn file_stat(meta: &std::fs::Metadata) -> Option<FileStat> {
+    let modified_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    #[cfg(unix)]
+    let changed_ns = {
+        use std::os::unix::fs::MetadataExt;
+        i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let changed_ns = 0;
+    Some(FileStat {
+        len: meta.len(),
+        modified_ns,
+        changed_ns,
+    })
 }
 
 impl ContentEntry {
@@ -59,20 +102,24 @@ fn exec_bits_of(_path: &Path) -> Option<u32> {
 /// [`list_content_files_strict`] instead.
 pub fn list_content_files(dir: &Path) -> Vec<ContentEntry> {
     // The lossy walk cannot fail: every error is skipped below.
-    walk_content_files(dir, false).unwrap_or_default()
+    walk_content_files(dir, false, false).unwrap_or_default()
 }
 
 /// [`list_content_files`] over the same content scope, but a directory that
 /// cannot be traversed is an error rather than an empty one.
 pub fn list_content_files_strict(dir: &Path) -> Result<Vec<ContentEntry>> {
-    walk_content_files(dir, true)
+    walk_content_files(dir, true, false)
 }
 
-fn walk_content_files(dir: &Path, strict: bool) -> Result<Vec<ContentEntry>> {
+fn walk_content_files(dir: &Path, strict: bool, skip_deps: bool) -> Result<Vec<ContentEntry>> {
     let mut entries = Vec::new();
     for result in WalkDir::new(dir).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
         !is_ignored(&name)
+            && !(skip_deps
+                && e.depth() > 0
+                && e.file_type().is_dir()
+                && DEPENDENCY_DIRS.contains(&name.as_ref()))
     }) {
         match result {
             Ok(entry) if entry.file_type().is_file() => entries.push(entry),
@@ -107,17 +154,19 @@ fn walk_content_files(dir: &Path, strict: bool) -> Result<Vec<ContentEntry>> {
             let exec_bits = exec_bits_of(entry.path());
             // Reuse WalkDir's already-fetched metadata for the mtime: no extra
             // stat, and no separate recursive walk to answer "last modified?".
-            let modified_ms = entry
-                .metadata()
-                .ok()
+            let metadata = entry.metadata().ok();
+            let modified_ms = metadata
+                .as_ref()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64);
+            let stat = metadata.as_ref().and_then(file_stat);
             ContentEntry {
                 relative_path,
                 path: entry.into_path(),
                 exec_bits,
                 modified_ms,
+                stat,
             }
         })
         .collect();
@@ -128,11 +177,31 @@ fn walk_content_files(dir: &Path, strict: bool) -> Result<Vec<ContentEntry>> {
 /// caller that already walked the tree (via [`list_content_files`]) can hash
 /// and inspect the same entries without walking again (#248).
 pub fn hash_entries(entries: &[ContentEntry]) -> String {
+    hash_entries_reading(entries, false).expect("a lossy hash skips unreadable files")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Files [`hash_entries_reading`] opened on this thread, so a test can tell
+    /// a reused hash from one that was read again and then discarded.
+    pub(crate) static FILES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The byte stream of [`hash_entries`]. With `strict`, a file that cannot be
+/// read is an error instead of hashing as if it were empty.
+fn hash_entries_reading(entries: &[ContentEntry], strict: bool) -> Result<String> {
     let mut hasher = Sha256::new();
     for entry in entries {
         hasher.update(entry.relative_path.as_bytes());
-        if let Ok(content) = std::fs::read(&entry.path) {
-            hasher.update(&content);
+        #[cfg(test)]
+        FILES_READ.with(|count| count.set(count.get() + 1));
+        match std::fs::read(&entry.path) {
+            Ok(content) => hasher.update(&content),
+            Err(err) if strict => {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("failed to read {}", entry.path.display())));
+            }
+            Err(_) => {}
         }
         // Include executable bit so permission-only changes are detected.
         #[cfg(unix)]
@@ -140,7 +209,80 @@ pub fn hash_entries(entries: &[ContentEntry]) -> String {
             hasher.update(&bits.to_le_bytes());
         }
     }
-    hex::encode(hasher.finalize())
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// A cheap fingerprint of the files [`hash_entries`] would read: their paths,
+/// sizes, modification times and exec bits, plus the change time on unix — no
+/// content. `None` when any file's metadata was unreadable.
+///
+/// It stands in for the content only as far as timestamps do, the same bet
+/// git's index and rsync make: a rewrite that keeps both the size and the
+/// modification time (a tool that restores mtimes) reads as unchanged. On
+/// unix the change time still moves then; on Windows it is not available.
+/// Timestamps are only as fine as the filesystem keeps them: on FAT or HFS+
+/// (seconds) a same-size write within that tick of the scan can also slip by.
+fn stamp_entries(entries: &[ContentEntry]) -> Option<String> {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        let stat = entry.stat?;
+        let path = entry.relative_path.as_bytes();
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path);
+        hasher.update(stat.len.to_le_bytes());
+        hasher.update(stat.modified_ns.to_le_bytes());
+        hasher.update(stat.changed_ns.to_le_bytes());
+        hasher.update(entry.exec_bits.unwrap_or(0).to_le_bytes());
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+/// [`hash_directory`]'s result, and the stamp it may be cached under.
+pub struct StampedHash {
+    pub hash: String,
+    /// Set only for a fresh hash whose every file was read, under a stamp that
+    /// did not move while it was read: a cache must never pair one state's
+    /// stamp with another state's hash, or every later lookup repeats the error.
+    pub stamp: Option<String>,
+}
+
+/// [`hash_directory`], except that `cached` — a `(stamp, hash)` pair an
+/// earlier call returned — is reused without reading any file while the
+/// directory's stamp still matches. A fresh hash is byte for byte the one
+/// [`hash_directory`] computes; a reused one is only as current as the stamp
+/// can tell — see [`stamp_entries`] for what it can miss.
+pub fn hash_directory_reusing(dir: &Path, cached: Option<(&str, &str)>) -> StampedHash {
+    let Ok(entries) = list_content_files_strict(dir) else {
+        return StampedHash {
+            hash: hash_entries(&list_content_files(dir)),
+            stamp: None,
+        };
+    };
+    let stamp = stamp_entries(&entries);
+    if let (Some(stamp), Some((cached_stamp, cached_hash))) = (&stamp, cached) {
+        if stamp == cached_stamp {
+            return StampedHash {
+                hash: cached_hash.to_string(),
+                stamp: None,
+            };
+        }
+    }
+    match (stamp, hash_entries_reading(&entries, true)) {
+        (Some(stamp), Ok(hash)) => {
+            let unchanged = list_content_files_strict(dir)
+                .ok()
+                .and_then(|again| stamp_entries(&again))
+                .is_some_and(|again| again == stamp);
+            StampedHash {
+                hash,
+                stamp: unchanged.then_some(stamp),
+            }
+        }
+        _ => StampedHash {
+            hash: hash_entries(&entries),
+            stamp: None,
+        },
+    }
 }
 
 /// Latest content-file modification time (ms since epoch) from a prepared
@@ -187,7 +329,7 @@ fn is_foldable_text(content: &[u8]) -> bool {
 /// A lone `\r` (old-Mac line ending, or a carriage return inside a progress
 /// bar) is left alone — only `\r\n` is a line ending both platforms mean the
 /// same thing by.
-fn fold_crlf(content: &[u8]) -> Cow<'_, [u8]> {
+pub(crate) fn fold_crlf(content: &[u8]) -> Cow<'_, [u8]> {
     if !is_foldable_text(content) || !content.windows(2).any(|pair| pair == b"\r\n") {
         return Cow::Borrowed(content);
     }
@@ -261,8 +403,11 @@ pub fn hash_entries_eol_insensitive(entries: &[ContentEntry]) -> Result<String> 
 ///   match on what remains;
 /// - an empty or missing directory is an error, not "the hash of nothing",
 ///   which every empty tree would share.
+///
+/// Dependency installs ([`DEPENDENCY_DIRS`]) are skipped as well: `npm install`
+/// in a local skill's source is not an update to offer (#502).
 pub fn hash_directory_eol_insensitive(dir: &Path) -> Result<String> {
-    let entries = list_content_files_strict(dir)?;
+    let entries = walk_content_files(dir, true, true)?;
     if entries.is_empty() {
         anyhow::bail!("no content files under {}", dir.display());
     }
@@ -274,6 +419,41 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    /// #502: the update tiebreaker looks past dependency installs, while the
+    /// stored-identity hash keeps seeing them.
+    #[test]
+    fn dependency_installs_only_bypass_the_update_tiebreaker() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("SKILL.md"), "# hello").unwrap();
+        let loose = hash_directory_eol_insensitive(tmp.path()).unwrap();
+        let strict = hash_directory(tmp.path()).unwrap();
+
+        for dir in [
+            "node_modules/pkg",
+            "scripts/node_modules/pkg",
+            ".venv/lib",
+            "venv/lib",
+        ] {
+            fs::create_dir_all(tmp.path().join(dir)).unwrap();
+            fs::write(tmp.path().join(dir).join("index.js"), "x").unwrap();
+        }
+
+        assert_eq!(hash_directory_eol_insensitive(tmp.path()).unwrap(), loose);
+        assert_ne!(hash_directory(tmp.path()).unwrap(), strict);
+    }
+
+    /// The skip applies below the root: a skill whose own directory happens to
+    /// be named `venv` still hashes its content.
+    #[test]
+    fn a_skill_directory_named_like_a_dependency_dir_is_still_hashed() {
+        let tmp = tempdir().unwrap();
+        let skill = tmp.path().join("venv");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "# hello").unwrap();
+
+        assert!(hash_directory_eol_insensitive(&skill).is_ok());
+    }
 
     /// Project-workspace skills may now be symlinks to the central library
     /// (#225). Sync-status classification hashes the project path directly,
@@ -359,7 +539,29 @@ mod tests {
             path,
             exec_bits: None,
             modified_ms: None,
+            stat: None,
         }
+    }
+
+    /// Without a change time (Windows), the size is what still notices a
+    /// rewrite that put the modification time back. A file whose metadata
+    /// could not be read leaves nothing to stamp.
+    #[test]
+    fn a_stamp_needs_every_stat_and_moves_with_the_size() {
+        let with_len = |len| {
+            let mut file = entry("SKILL.md", PathBuf::from("SKILL.md"));
+            file.stat = Some(FileStat {
+                len,
+                modified_ns: 1,
+                changed_ns: 0,
+            });
+            file
+        };
+        let stamp = |len| stamp_entries(&[with_len(len)]).unwrap();
+        assert_ne!(stamp(1), stamp(2));
+
+        let unknown = entry("notes.md", PathBuf::from("notes.md"));
+        assert_eq!(stamp_entries(&[with_len(1), unknown]), None);
     }
 
     /// The tiebreaker only ever *suppresses* an update, so a file it could not

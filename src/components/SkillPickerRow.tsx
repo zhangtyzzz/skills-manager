@@ -57,7 +57,7 @@ export function SkillPickerRow({
     >
       <div
         className={cn(
-          "flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
+          "flex h-4 w-4 shrink-0 items-center justify-center rounded-[4px] border transition-colors",
           selectable && selected
             ? "border-accent bg-accent text-white"
             : selectable
@@ -88,7 +88,7 @@ export function SkillPickerRow({
               <span
                 key={tag}
                 className={cn(
-                  "inline-flex items-center rounded-full px-1.5 py-0.5 text-[10.5px] font-medium",
+                  "inline-flex items-center rounded-full px-1.5 py-0.5 text-[11px] font-medium",
                   getTagColor(tag, allTags),
                 )}
               >

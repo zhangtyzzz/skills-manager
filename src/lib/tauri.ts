@@ -259,11 +259,16 @@ export interface BatchDeleteSkillsResult {
   failed: string[];
 }
 
+export interface InstallLocalResult {
+  skill_id: string;
+  name: string;
+}
+
 export const deleteManagedSkills = (skillIds: string[]) =>
   invoke<BatchDeleteSkillsResult>("delete_managed_skills", { skillIds });
 
 export const installLocal = (sourcePath: string, name?: string) =>
-  invoke<void>("install_local", { sourcePath, name: name || null });
+  invoke<InstallLocalResult>("install_local", { sourcePath, name: name || null });
 
 export const installGit = (repoUrl: string, name?: string) =>
   invoke<void>("install_git", { repoUrl, name: name || null });
@@ -452,6 +457,9 @@ export const getCentralRepoPath = () =>
 
 export const getCentralRepoPathOverride = () =>
   invoke<string | null>("get_central_repo_path_override");
+
+export const getCentralRepoPendingPath = () =>
+  invoke<string | null>("get_central_repo_pending_path");
 
 export const getCentralRepoWarnings = () =>
   invoke<string[]>("get_central_repo_warnings");
@@ -716,11 +724,23 @@ export const gitBackupResolveConflict = (
   action: ResolveConflictAction,
 ) => invoke<string>("git_backup_resolve_conflict", { skillId, action });
 
-export const gitBackupClone = (url: string) =>
-  invoke<void>("git_backup_clone", { url });
+/** Local skills that differ from the remote's same-named copies stop the
+ *  clone (`CLONE_LOCAL_DIFFERS`) unless `setAside` is exactly that list, as
+ *  the user confirmed it: their local versions are then saved to a folder
+ *  beside the library, which this resolves to (otherwise `null`). */
+export const gitBackupClone = (url: string, setAside: string[] = []) =>
+  invoke<string | null>("git_backup_clone", { url, setAside });
 
-export const gitBackupReclone = (url: string) =>
-  invoke<void>("git_backup_reclone", { url });
+/** What a re-clone left beside the library: the previous `.git` when its
+ *  history could not be proven to be on the remote, and the set-aside local
+ *  versions (see `gitBackupClone`). */
+export interface RecloneResult {
+  kept_git: string | null;
+  local_copies: string | null;
+}
+
+export const gitBackupReclone = (url: string, setAside: string[] = []) =>
+  invoke<RecloneResult>("git_backup_reclone", { url, setAside });
 
 export const gitBackupCreateSnapshot = () =>
   invoke<string>("git_backup_create_snapshot");
@@ -805,6 +825,10 @@ export const addLinkedWorkspace = (name: string, path: string, disabledPath?: st
 
 export const removeProject = (id: string) =>
   invoke<void>("remove_project", { id });
+
+/** Shows a workspace's folder in the OS file manager, selecting the folder. */
+export const revealProjectFolder = (projectId: string) =>
+  invoke<void>("reveal_project_folder", { projectId });
 
 export const scanProjects = (root: string) =>
   invoke<string[]>("scan_projects", { root });

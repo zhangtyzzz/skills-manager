@@ -1,8 +1,9 @@
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
-import type { ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 
-const IS_MACOS = navigator.userAgent.includes("Mac");
+import { IS_MACOS } from "../lib/platform";
+import { cn } from "../utils";
 
 interface DetailSheetProps {
   open: boolean;
@@ -21,10 +22,33 @@ export function DetailSheet({
   onClose,
   children,
 }: DetailSheetProps) {
+  const sheetRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing) return;
+      const sheet = sheetRef.current;
+      if (!sheet) return;
+      const rect = sheet.getBoundingClientRect();
+      // Leave Escape to any dialog covering the detail sheet.
+      const topElement = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+      if (!topElement || !sheet.contains(topElement)) return;
+      e.preventDefault();
+      onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, onClose]);
+
   if (!open) return null;
 
+  // Reserve space for the macOS drag bar.
   return createPortal(
-    <div className="fixed top-[28px] right-0 bottom-0 left-[220px] z-40 isolate">
+    <div
+      ref={sheetRef}
+      className={cn("fixed right-0 bottom-0 left-[220px] z-40 isolate", IS_MACOS ? "top-[28px]" : "top-0")}
+    >
       <div
         className={
           IS_MACOS

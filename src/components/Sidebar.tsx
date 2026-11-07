@@ -29,6 +29,7 @@ import { AgentIcon } from "./AgentIcon";
 import * as api from "../lib/tauri";
 import type { SyncHealth, ToolCategory, ToolInfo } from "../lib/tauri";
 import { getPresetIconOption } from "../lib/presetIcons";
+import { IS_MACOS } from "../lib/platform";
 
 function getSyncHealthIndicator(health: SyncHealth, skillCount: number): { color: string; title: string } | null {
   if (skillCount === 0) return null;
@@ -48,10 +49,10 @@ export function Sidebar() {
   const { t } = useTranslation();
   const location = useLocation();
   const navigate = useNavigate();
-  const { presets, viewedPreset, setViewedPresetId, refreshPresets, refreshManagedSkills, projects, refreshProjects, tools, managedSkills, appUpdate } = useApp();
+  const { presets, viewedPreset, setViewedPresetId, closeSkillDetail, refreshPresets, refreshManagedSkills, projects, refreshProjects, tools, managedSkills, appUpdate } = useApp();
   const [showCreate, setShowCreate] = useState(false);
   const [showAddProject, setShowAddProject] = useState(false);
-  const [renameTarget, setRenameTarget] = useState<{ id: string; name: string; icon?: string | null } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{ id: string; name: string; icon?: string | null; description?: string | null } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const [deleteProjectTarget, setDeleteProjectTarget] = useState<{ id: string; name: string } | null>(null);
   const installedTools = useMemo(() => tools.filter((t) => t.installed && t.enabled), [tools]);
@@ -172,6 +173,7 @@ export function Sidebar() {
   ];
 
   const handleSwitchPreset = (id: string) => {
+    closeSkillDetail();
     setViewedPresetId(id);
     if (location.pathname !== "/my-skills") {
       navigate("/my-skills");
@@ -187,18 +189,18 @@ export function Sidebar() {
     toast.success(t("preset.created"));
   };
 
-  const handleRenamePreset = async (newName: string, icon?: string) => {
+  const handleRenamePreset = async (newName: string, icon?: string, description?: string) => {
     if (!renameTarget) return;
     const preset = presets.find((s) => s.id === renameTarget.id);
     if (!preset) return;
     await api.updatePreset(
       renameTarget.id,
       newName,
-      preset.description || undefined,
+      description,
       icon || preset.icon || undefined
     );
     await refreshPresets();
-    toast.success(t("preset.renamed"));
+    toast.success(t("preset.updated"));
   };
 
   const handleDeletePreset = async () => {
@@ -213,7 +215,7 @@ export function Sidebar() {
 
   const handleRenameClick = (
     event: React.MouseEvent,
-    preset: { id: string; name: string; icon?: string | null }
+    preset: { id: string; name: string; icon?: string | null; description?: string | null }
   ) => {
     event.preventDefault();
     event.stopPropagation();
@@ -276,14 +278,14 @@ export function Sidebar() {
                 <Link
                   to={group.basePath}
                   className={cn(
-                    "mb-0.5 flex items-center gap-2 px-2.5 py-[7px] rounded-md text-sm transition-colors outline-none",
+                    "mb-0.5 flex items-center gap-2 px-2.5 py-[7px] rounded-md text-[14px] leading-5 transition-colors outline-none",
                     isActive
                       ? "bg-surface-active font-medium text-primary"
                       : "text-tertiary hover:text-secondary hover:bg-surface-hover"
                   )}
                 >
                   <span className={cn(
-                    "flex h-[20px] w-[20px] shrink-0 items-center justify-center rounded border",
+                    "flex h-[20px] w-[20px] shrink-0 items-center justify-center rounded-[4px] border",
                     isActive
                       ? "border-accent/30 bg-accent/10 text-accent"
                       : "border-border bg-surface text-muted"
@@ -322,7 +324,7 @@ export function Sidebar() {
                                 <button
                                   onClick={() => navigate(`${group.basePath}/${tool.key}`)}
                                   className={cn(
-                                    "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-[7px] text-left text-sm leading-5 outline-none",
+                                    "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-[7px] text-left text-[14px] leading-5 outline-none",
                                     isActive ? "font-medium text-primary" : "text-tertiary group-hover:text-secondary"
                                   )}
                                 >
@@ -330,7 +332,7 @@ export function Sidebar() {
                                     agentKey={tool.key}
                                     displayName={tool.display_name}
                                     className={cn(
-                                      "h-[20px] w-[20px] rounded border transition-colors",
+                                      "h-[20px] w-[20px] rounded-[4px] border transition-colors",
                                       isActive ? "border-accent/30 bg-accent/10" : "group-hover:border-border"
                                     )}
                                   />
@@ -352,7 +354,7 @@ export function Sidebar() {
                                 )}>
                                   <div
                                     {...provided.dragHandleProps}
-                                    className="rounded p-1 text-faint cursor-grab active:cursor-grabbing"
+                                    className="rounded-md p-1 text-faint cursor-grab active:cursor-grabbing"
                                   >
                                     <GripVertical className="h-3 w-3" />
                                   </div>
@@ -377,16 +379,16 @@ export function Sidebar() {
   return (
     <>
       <div className="w-[220px] flex-shrink-0 bg-bg-secondary border-r border-border-subtle h-full flex flex-col select-none relative z-10">
-        {/* Traffic-light safe zone */}
-        <div className="h-[38px] shrink-0" />
-        {/* App logo — sits below macOS window controls */}
+        {/* Only macOS needs the extra 28px for overlaid window controls. */}
+        <div className={cn("shrink-0", IS_MACOS ? "h-[38px]" : "h-2.5")} />
+        {/* App logo — follows the platform's title-bar spacing. */}
         <div className="flex items-center px-3 gap-3 pb-2.5 shrink-0">
           <img
             src="/icons/32x32.png"
             alt="logo"
             className="w-[24px] h-[24px] shrink-0"
           />
-          <span className="text-[16px] font-semibold text-secondary tracking-tight truncate leading-[22px]">
+          <span className="text-[17px] font-semibold text-secondary tracking-tight truncate leading-[22px]">
             {t("app.name")}
           </span>
         </div>
@@ -401,7 +403,7 @@ export function Sidebar() {
                 key={item.path}
                 to={item.path}
                 className={cn(
-                  "flex items-center gap-2.5 px-2.5 py-[7px] rounded-md text-sm font-medium transition-colors outline-none",
+                  "flex items-center gap-2.5 px-2.5 py-[7px] rounded-md text-[14px] leading-5 font-medium transition-colors outline-none",
                   isActive
                     ? "bg-surface-active text-primary"
                     : "text-tertiary hover:text-secondary hover:bg-surface-hover"
@@ -461,14 +463,15 @@ export function Sidebar() {
                               >
                                 <button
                                   onClick={() => handleSwitchPreset(preset.id)}
+                                  title={preset.description || undefined}
                                   className={cn(
-                                    "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-[7px] text-left text-sm leading-5 outline-none",
+                                    "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-[7px] text-left text-[14px] leading-5 outline-none",
                                     isActive ? "font-medium text-primary" : "text-tertiary group-hover:text-secondary"
                                   )}
                                 >
                                   <span
                                     className={cn(
-                                      "flex h-[20px] w-[20px] shrink-0 items-center justify-center rounded border",
+                                      "flex h-[20px] w-[20px] shrink-0 items-center justify-center rounded-[4px] border",
                                       isActive
                                         ? `${presetIcon.activeClass} ${presetIcon.colorClass}`
                                         : "border-border bg-surface text-muted group-hover:border-border group-hover:text-tertiary"
@@ -498,20 +501,20 @@ export function Sidebar() {
                                 )}>
                                   <div
                                     {...provided.dragHandleProps}
-                                    className="rounded p-1 text-faint cursor-grab active:cursor-grabbing"
+                                    className="rounded-md p-1 text-faint cursor-grab active:cursor-grabbing"
                                   >
                                     <GripVertical className="h-3 w-3" />
                                   </div>
                                   <button
                                     onClick={(event) => handleRenameClick(event, preset)}
-                                    className="rounded p-1 text-faint transition hover:text-secondary"
-                                    title={t("common.rename")}
+                                    className="rounded-md p-1 text-faint transition hover:text-secondary"
+                                    title={t("common.edit")}
                                   >
                                     <Pencil className="h-3 w-3" />
                                   </button>
                                   <button
                                     onClick={(event) => handleDeleteClick(event, preset)}
-                                    className="rounded p-1 text-faint transition hover:text-red-400"
+                                    className="rounded-md p-1 text-faint transition hover:text-red-600 dark:hover:text-red-400"
                                     title={t("common.delete")}
                                   >
                                     <Trash2 className="h-3 w-3" />
@@ -529,7 +532,7 @@ export function Sidebar() {
               </DragDropContext>
               <button
                 onClick={() => setShowCreate(true)}
-                className="flex items-center gap-2 px-2.5 py-[7px] mt-1 rounded-md text-sm text-muted hover:text-secondary hover:bg-surface-hover transition-colors w-full outline-none"
+                className="flex items-center gap-2 px-2.5 py-[7px] mt-1 rounded-md text-[14px] leading-5 text-muted hover:text-secondary hover:bg-surface-hover transition-colors w-full outline-none"
               >
                 <Plus className="w-3.5 h-3.5" />
                 {t("sidebar.newPreset")}
@@ -619,13 +622,13 @@ export function Sidebar() {
                                 <button
                                   onClick={() => navigate(`/project/${project.id}`)}
                                   className={cn(
-                                    "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-[7px] text-left text-sm leading-5 outline-none",
+                                    "flex min-w-0 flex-1 items-center gap-2 px-2.5 py-[7px] text-left text-[14px] leading-5 outline-none",
                                     isActive ? "font-medium text-primary" : "text-tertiary group-hover:text-secondary"
                                   )}
                                 >
                                   <span
                                     className={cn(
-                                      "flex h-[20px] w-[20px] shrink-0 items-center justify-center rounded border",
+                                      "flex h-[20px] w-[20px] shrink-0 items-center justify-center rounded-[4px] border",
                                       isActive
                                         ? project.workspace_type === "linked"
                                           ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-500"
@@ -665,7 +668,7 @@ export function Sidebar() {
                                 )}>
                                   <div
                                     {...provided.dragHandleProps}
-                                    className="rounded p-1 text-faint cursor-grab active:cursor-grabbing"
+                                    className="rounded-md p-1 text-faint cursor-grab active:cursor-grabbing"
                                   >
                                     <GripVertical className="h-3 w-3" />
                                   </div>
@@ -675,7 +678,7 @@ export function Sidebar() {
                                       e.stopPropagation();
                                       setDeleteProjectTarget(project);
                                     }}
-                                    className="rounded p-1 text-faint transition hover:text-red-400"
+                                    className="rounded-md p-1 text-faint transition hover:text-red-600 dark:hover:text-red-400"
                                     title={t("common.delete")}
                                   >
                                     <Trash2 className="h-3 w-3" />
@@ -693,7 +696,7 @@ export function Sidebar() {
               </DragDropContext>
               <button
                 onClick={() => setShowAddProject(true)}
-                className="flex items-center gap-2 px-2.5 py-[7px] mt-1 rounded-md text-sm text-muted hover:text-secondary hover:bg-surface-hover transition-colors w-full outline-none"
+                className="flex items-center gap-2 px-2.5 py-[7px] mt-1 rounded-md text-[14px] leading-5 text-muted hover:text-secondary hover:bg-surface-hover transition-colors w-full outline-none"
               >
                 <Plus className="w-3.5 h-3.5" />
                 {t("sidebar.addProject")}
@@ -708,7 +711,7 @@ export function Sidebar() {
           <Link
             to="/settings"
             className={cn(
-              "flex items-center gap-2.5 px-2.5 py-[7px] rounded-md text-sm font-medium transition-colors outline-none",
+              "flex items-center gap-2.5 px-2.5 py-[7px] rounded-md text-[14px] leading-5 font-medium transition-colors outline-none",
               location.pathname === "/settings"
                 ? "bg-surface-active text-primary"
                 : "text-tertiary hover:text-secondary hover:bg-surface-hover"
@@ -743,6 +746,7 @@ export function Sidebar() {
         open={renameTarget !== null}
         currentName={renameTarget?.name || ""}
         currentIcon={renameTarget?.icon}
+        currentDescription={renameTarget?.description}
         onClose={() => setRenameTarget(null)}
         onRename={handleRenamePreset}
       />
