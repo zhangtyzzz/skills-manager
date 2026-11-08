@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.45.1] - 2026-11-08
+
+### Release Overview
+- The in-app update check now reads this fork's own releases, so fork-only versions show up and can be installed from within the app.
+
+### User-facing
+- **Update check looks at the right place** — The 检查更新 button compared against the upstream project's releases, which stopped at 1.43.3; any fork release after that never showed as an update and the in-app install entry stayed hidden behind "already up to date". The check now reads the same repository the updater installs from (#4).
+
+### Developer & Governance
+- `check_app_update` queries `repos/zhangtyzzz/skills-manager/releases/latest`, matching the updater endpoint and pubkey that already pointed at this fork since 6561ee2 (#4).
+
 ## [1.45.0] - 2026-11-08
 
 ### Release Overview
