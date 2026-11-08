@@ -648,6 +648,22 @@ export interface GitlabBackupConnectResult {
 export const gitlabBackupConnect = (baseUrl: string, token: string, projectPath: string) =>
   invoke<GitlabBackupConnectResult>("gitlab_backup_connect", { baseUrl, token, projectPath });
 
+export interface GiteeBackupConnectResult {
+  url: string;
+  login: string;
+  repo_created: boolean;
+  /** False when the connected repository is not `private`. */
+  repo_private: boolean;
+  remote_has_content: boolean;
+}
+
+/** Gitee guided connect (PAT / 私人令牌): validates the token against
+ * gitee.com, finds or creates the private backup repository, stores the
+ * token in the OS keychain, saves the URL. A bare name targets the owner's
+ * personal namespace; `owner/repo` connects an existing repository. */
+export const giteeBackupConnect = (token: string, repoPath: string) =>
+  invoke<GiteeBackupConnectResult>("gitee_backup_connect", { token, repoPath });
+
 /** Migrate token-in-URL remotes to the OS keychain. Returns the sanitized URL if migrated. */
 export const gitBackupMigrateCredentials = () =>
   invoke<string | null>("git_backup_migrate_credentials");

@@ -206,6 +206,32 @@
       "deleteRemoteDesc": "Permanently delete the backup project on GitLab; other devices can no longer sync. Local skills are kept.",
       "deleteRemoteConfirm": "This opens the GitLab project's Settings → General page — delete the project at the bottom under Advanced (GitLab asks you to confirm by typing its name). Afterward, other devices will report a missing remote when they sync."
     },
+    "gitee": {
+      "title": "Connect with Gitee",
+      "desc": "Works with gitee.com. Sign in with a personal access token and the private backup repository is set up for you. Credentials are stored in the system keychain, never in files.",
+      "repoLabel": "Repository path",
+      "repoPlaceholder": "skills-manager-backup",
+      "repoHint": "A bare name creates a private repository in your personal namespace; a full path like owner/repo connects an existing repository (it must already exist).",
+      "tokenPlaceholder": "Gitee personal access token",
+      "tokenHint": "Create a token on Gitee (grant the projects and user_info scopes)",
+      "connect": "Connect",
+      "connecting": "Connecting…",
+      "repoCreated": "Created private repository {{repo}}.",
+      "publicRepoWarning": "Heads up: the connected repository is not private — its contents may be readable by others. If that's not intended, change its visibility on Gitee under Settings → Basic Settings.",
+      "errorToken": "Gitee rejected the token. Check that it hasn't expired and was copied completely.",
+      "errorScope": "The token can't create or access the repository. Creating repositories needs the \"projects\" scope, and accessing one needs it too — regenerate the token with it enabled.",
+      "errorRepo": "That repository doesn't exist (or the token can't see it). Repositories under other owners are never created automatically — create it on Gitee first, or use a bare name for your personal namespace.",
+      "errorRepoRejected": "Gitee refused this repository name — it may already be taken, or the name isn't allowed. Try a different one.",
+      "errorKeychain": "Couldn't store the token in the system keychain. Guided Gitee setup requires the keychain; you can still use the advanced Git URL below.",
+      "sshHint": "Prefer SSH? Paste the SSH remote URL into the advanced Git URL section below.",
+      "reconnect": "Reconnect Gitee",
+      "reconnectTitle": "Reconnect Gitee",
+      "revokeHintPat": "Deleting the token on Gitee only affects devices using it.",
+      "revokeConfirmTitle": "Revoke Gitee token?",
+      "revokeConfirmPat": "This opens Gitee's personal access tokens page — delete the backup token there. Devices using it lose access; this machine disconnects immediately. The remote backup data is kept.",
+      "deleteRemoteDesc": "Permanently delete the backup repository on Gitee; other devices can no longer sync. Local skills are kept.",
+      "deleteRemoteConfirm": "This opens the Gitee repository's Settings page — delete the repository at the bottom (Gitee asks you to confirm). Afterward, other devices will report a missing remote when they sync."
+    },
     "history": {
       "title": "Backup History",
       "empty": "No visible snapshots yet. Run a backup to create one."

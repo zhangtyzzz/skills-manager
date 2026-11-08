@@ -206,6 +206,32 @@
       "deleteRemoteDesc": "从 GitLab 永久删除备份项目，其他设备将无法再同步。本机技能保留。",
       "deleteRemoteConfirm": "将打开 GitLab 项目的 Settings → General 页面，请在页面底部 Advanced 中删除项目——GitLab 会要求输入项目名二次确认。删除后其他设备同步时会提示远端不存在。"
     },
+    "gitee": {
+      "title": "使用 Gitee 连接",
+      "desc": "支持 gitee.com。使用私人令牌登录，私有备份仓库会自动创建。凭证保存在系统钥匙串中，不会写进任何文件。",
+      "repoLabel": "仓库路径",
+      "repoPlaceholder": "skills-manager-backup",
+      "repoHint": "填裸名字会在你的个人命名空间创建私有仓库；填完整路径（如 owner/repo）则连接已有仓库——它必须事先存在。",
+      "tokenPlaceholder": "Gitee 私人令牌",
+      "tokenHint": "去 Gitee 创建私人令牌（勾选 projects 和 user_info 权限）",
+      "connect": "连接",
+      "connecting": "正在连接…",
+      "repoCreated": "已创建私有仓库 {{repo}}。",
+      "publicRepoWarning": "注意：连接的备份仓库不是私有的——仓库内容可能被他人读取。如非有意，请到 Gitee 仓库的 设置 → 基本设置 修改可见性。",
+      "errorToken": "Gitee 拒绝了该令牌。请检查它是否过期、是否复制完整。",
+      "errorScope": "该令牌无法创建或访问仓库。创建仓库需要「projects」权限，访问已有仓库也需要它——请重新生成令牌并勾选。",
+      "errorRepo": "仓库不存在（或令牌无权查看）。他人/组织名下的仓库不会自动创建——请先在 Gitee 上建好，或改用裸名字在你的个人命名空间创建。",
+      "errorRepoRejected": "Gitee 拒绝了这个仓库名——可能已被占用或命名不合规，请换一个试试。",
+      "errorKeychain": "无法将令牌存入系统钥匙串。Gitee 引导连接依赖钥匙串；你仍可使用下方的高级 Git 地址方式。",
+      "sshHint": "想用 SSH？把 SSH 远程地址粘贴到下方的高级 Git 地址中即可。",
+      "reconnect": "重新连接 Gitee",
+      "reconnectTitle": "重新连接 Gitee",
+      "revokeHintPat": "在 Gitee 删除该令牌只影响使用它的设备。",
+      "revokeConfirmTitle": "撤销 Gitee 令牌？",
+      "revokeConfirmPat": "将打开 Gitee 的私人令牌页面，请在那里删除备份所用的令牌。使用该令牌的设备会失去访问；本机连接会立即断开。远端备份数据保留。",
+      "deleteRemoteDesc": "从 Gitee 永久删除备份仓库，其他设备将无法再同步。本机技能保留。",
+      "deleteRemoteConfirm": "将打开 Gitee 仓库的设置页面，请在页面底部删除仓库——Gitee 会要求二次确认。删除后其他设备同步时会提示远端不存在。"
+    },
     "history": {
       "title": "备份历史",
       "empty": "还没有可见快照。执行一次备份后会生成。"
