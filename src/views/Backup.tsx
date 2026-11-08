@@ -49,18 +49,28 @@ type BackupMode =
   | "up_to_date"
   | "pending_changes";
 
-type LoadingAction = "start" | "sync" | "recovery" | "save" | "disconnect" | "github" | "gitlab" | null;
+type LoadingAction = "start" | "sync" | "recovery" | "save" | "disconnect" | "github" | "gitlab" | "gitee" | null;
 
 const DEFAULT_BACKUP_REPO = "skills-manager-backup";
 const GITHUB_TOKEN_URL =
   "https://github.com/settings/tokens/new?scopes=repo&description=Skills%20Manager%20Backup";
 const GITLAB_DEFAULT_BASE_URL = "https://gitlab.com";
+/** Gitee's token page (设置 → 安全设置 → 私人令牌); no scope prefill support. */
+const GITEE_TOKEN_URL = "https://gitee.com/profile/personal_access_tokens";
 /** `scopes=api` pre-selects the scope needed to create the backup project. */
 const gitlabTokenUrl = (baseUrl: string) => {
   const base = baseUrl.trim().replace(/\/+$/, "");
   return `${base.includes("://") ? base : `https://${base}`}/-/user_settings/personal_access_tokens?scopes=api`;
 };
-type ConnectProvider = "github" | "gitlab";
+type ConnectProvider = "github" | "gitlab" | "gitee";
+
+/** lucide-react has no Gitee mark; this is the official Gitee logo
+ * (simple-icons path), drawn filled like the Github/Gitlab glyphs. */
+const GiteeIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="currentColor" className={className} aria-hidden="true">
+    <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.568 7.713c-.084-.084-.2-.13-.318-.13H8.271c-.322 0-.583.262-.583.583v1.571c0 .322.262.583.583.583h5.982c.322 0 .583.262.583.583v.624c0 .322-.262.583-.583.583h-5.98c-.322 0-.583.261-.583.582v5.574c0 .321.261.583.582.583h1.571c.322 0 .583-.262.583-.583v-3.334c0-.321.261-.582.583-.582h3.244c.322 0 .583-.262.583-.583V9.757l-.001-.008c.001-.014.002-.028.002-.041V7.996c0-.11-.045-.21-.117-.283z" />
+  </svg>
+);
 type RecoveryReason = GitUpstreamHealth | "conflict";
 
 function displaySnapshotLabel(tag: string) {
@@ -138,6 +148,9 @@ export function Backup() {
   const [gitlabProjectPath, setGitlabProjectPath] = useState(DEFAULT_BACKUP_REPO);
   const [gitlabToken, setGitlabToken] = useState("");
   const [gitlabError, setGitlabError] = useState<string | null>(null);
+  const [giteeRepoPath, setGiteeRepoPath] = useState(DEFAULT_BACKUP_REPO);
+  const [giteeToken, setGiteeToken] = useState("");
+  const [giteeError, setGiteeError] = useState<string | null>(null);
 
   // Abandon an in-flight device-flow poll loop when leaving the page.
   useEffect(() => () => {
@@ -603,7 +616,7 @@ export function Backup() {
   /** Shared tail of both connect paths and both providers: wire the repo
    * locally and either restore the existing backup or push the first one. */
   const finishConnect = async (
-    res: api.GithubBackupConnectResult | api.GitlabBackupConnectResult,
+    res: api.GithubBackupConnectResult | api.GitlabBackupConnectResult | api.GiteeBackupConnectResult,
     provider: ConnectProvider,
   ) => {
     setReconnectMode(false);
@@ -628,7 +641,9 @@ export function Backup() {
       toast.success(
         provider === "gitlab"
           ? t("backup.gitlab.projectCreated", { repo })
-          : t("backup.github.repoCreated", { repo }),
+          : provider === "gitee"
+            ? t("backup.gitee.repoCreated", { repo })
+            : t("backup.github.repoCreated", { repo }),
       );
     }
     if (!res.repo_private) {
@@ -636,7 +651,9 @@ export function Backup() {
       toast.warning(
         provider === "gitlab"
           ? t("backup.gitlab.publicProjectWarning")
-          : t("backup.github.publicRepoWarning"),
+          : provider === "gitee"
+            ? t("backup.gitee.publicRepoWarning")
+            : t("backup.github.publicRepoWarning"),
         { duration: 15000 },
       );
     }
@@ -717,6 +734,39 @@ export function Backup() {
       await finishConnect(res, "gitlab");
     } catch (error) {
       setGitlabError(mapGitlabError(error));
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  const mapGiteeError = (error: unknown) => {
+    const message = getErrorMessage(error, "");
+    if (message.includes("GITEE_TOKEN_INVALID")) return t("backup.gitee.errorToken");
+    if (message.includes("GITEE_SCOPE")) return t("backup.gitee.errorScope");
+    if (message.includes("GITEE_REPO_NOT_FOUND")) return t("backup.gitee.errorRepo");
+    if (message.includes("GITEE_REPO_REJECTED")) return t("backup.gitee.errorRepoRejected");
+    if (message.includes("KEYCHAIN_UNAVAILABLE")) return t("backup.gitee.errorKeychain");
+    if (message.includes("GITEE_NETWORK") || getErrorKind(error) === "network") {
+      return t("settings.gitErrorNetwork");
+    }
+    return mapGitError(error);
+  };
+
+  const handleGiteeConnect = async () => {
+    const token = giteeToken.trim();
+    if (!token) return;
+    setLoading("gitee");
+    setGiteeError(null);
+    try {
+      const res = await api.giteeBackupConnect(
+        token,
+        giteeRepoPath.trim() || DEFAULT_BACKUP_REPO,
+      );
+      // Token is in the OS keychain now; drop it from component state.
+      setGiteeToken("");
+      await finishConnect(res, "gitee");
+    } catch (error) {
+      setGiteeError(mapGiteeError(error));
     } finally {
       setLoading(null);
     }
@@ -826,12 +876,17 @@ export function Backup() {
   // the setting existed fall back to github.com host detection.
   const provider = backupProvider || (isGithubRemote ? "github" : "");
   const isGitlabProvider = provider === "gitlab";
+  const isGiteeProvider = provider === "gitee";
   const gitlabBase = gitlabBaseUrl.trim().replace(/\/+$/, "");
   const remoteRepoWebUrl = (() => {
     if (isGitlabProvider) {
       if (!remoteUrlValue.startsWith(`${gitlabBase}/`)) return null;
       const path = remoteUrlValue.slice(gitlabBase.length + 1).replace(/\.git$/, "");
       return path ? `${gitlabBase}/${path}` : null;
+    }
+    if (isGiteeProvider) {
+      const match = remoteUrlValue.match(/gitee\.com\/([^/]+\/[^/]+?)(\.git)?$/);
+      return match ? `https://gitee.com/${match[1]}` : null;
     }
     const match = remoteUrlValue.match(/github\.com[/:]([^/]+\/[^/]+?)(\.git)?$/);
     return match ? `https://github.com/${match[1]}` : null;
@@ -850,6 +905,8 @@ export function Backup() {
     setRevokeConfirmOpen(false);
     if (isGitlabProvider) {
       openUrl(`${gitlabBase}/-/user_settings/personal_access_tokens`).catch(() => {});
+    } else if (isGiteeProvider) {
+      openUrl(GITEE_TOKEN_URL).catch(() => {});
     } else {
       const oauthUrl = `https://github.com/settings/connections/applications/${GITHUB_OAUTH_CLIENT_ID}`;
       const patUrl = "https://github.com/settings/tokens";
@@ -876,6 +933,8 @@ export function Backup() {
     if (remoteRepoWebUrl) {
       const settingsUrl = isGitlabProvider
         ? `${remoteRepoWebUrl}/-/settings/general`
+        : isGiteeProvider
+        ? `${remoteRepoWebUrl}/settings`
         : `${remoteRepoWebUrl}/settings#danger-zone`;
       await openUrl(settingsUrl).catch(() => {});
       toast.info(t("backup.disconnect.deleteRemoteOpened"), { duration: 12000 });
@@ -976,14 +1035,18 @@ export function Backup() {
                   <button
                     type="button"
                     onClick={() => {
-                      setConnectProvider(isGitlabProvider ? "gitlab" : "github");
+                      setConnectProvider(isGitlabProvider ? "gitlab" : isGiteeProvider ? "gitee" : "github");
                       setReconnectMode(true);
                     }}
                     disabled={!!loading}
                     className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[13px] font-medium text-amber-700 transition-colors hover:bg-amber-500/15 disabled:opacity-50 dark:text-amber-300"
                   >
-                    {isGitlabProvider ? <Gitlab className="h-3.5 w-3.5" /> : <Github className="h-3.5 w-3.5" />}
-                    {isGitlabProvider ? t("backup.gitlab.reconnect") : t("backup.github.reconnect")}
+                    {isGitlabProvider ? <Gitlab className="h-3.5 w-3.5" /> : isGiteeProvider ? <GiteeIcon className="h-3.5 w-3.5" /> : <Github className="h-3.5 w-3.5" />}
+                    {isGitlabProvider
+                      ? t("backup.gitlab.reconnect")
+                      : isGiteeProvider
+                      ? t("backup.gitee.reconnect")
+                      : t("backup.github.reconnect")}
                   </button>
                 )}
                 {mode === "needs_fix" ? (
@@ -1110,6 +1173,8 @@ export function Backup() {
               <div className="mb-3 flex items-center gap-2">
                 {connectProvider === "gitlab" ? (
                   <Gitlab className="h-4 w-4 text-muted" />
+                ) : connectProvider === "gitee" ? (
+                  <GiteeIcon className="h-4 w-4 text-muted" />
                 ) : (
                   <Github className="h-4 w-4 text-muted" />
                 )}
@@ -1117,13 +1182,17 @@ export function Backup() {
                   {reconnectMode
                     ? connectProvider === "gitlab"
                       ? t("backup.gitlab.reconnectTitle")
+                      : connectProvider === "gitee"
+                      ? t("backup.gitee.reconnectTitle")
                       : t("backup.github.reconnectTitle")
                     : connectProvider === "gitlab"
                       ? t("backup.gitlab.title")
+                      : connectProvider === "gitee"
+                      ? t("backup.gitee.title")
                       : t("backup.github.title")}
                 </h2>
                 <div className="ml-auto flex items-center gap-0.5 rounded-lg border border-border-subtle bg-bg-secondary p-0.5">
-                  {(["github", "gitlab"] as const).map((p) => (
+                  {(["github", "gitlab", "gitee"] as const).map((p) => (
                     <button
                       key={p}
                       type="button"
@@ -1136,16 +1205,76 @@ export function Backup() {
                           : "text-tertiary hover:text-secondary",
                       )}
                     >
-                      {p === "github" ? "GitHub" : "GitLab"}
+                      {p === "github" ? "GitHub" : p === "gitlab" ? "GitLab" : "Gitee"}
                     </button>
                   ))}
                 </div>
               </div>
               <p className="mb-3 text-[13px] leading-5 text-muted">
-                {connectProvider === "gitlab" ? t("backup.gitlab.desc") : t("backup.github.desc")}
+                {connectProvider === "gitlab"
+                  ? t("backup.gitlab.desc")
+                  : connectProvider === "gitee"
+                  ? t("backup.gitee.desc")
+                  : t("backup.github.desc")}
               </p>
 
-              {connectProvider === "gitlab" ? (
+              {connectProvider === "gitee" ? (
+                // Gitee guided connect: PAT (私人令牌) only — no device flow.
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={giteeRepoPath}
+                      onChange={(event) => setGiteeRepoPath(event.target.value)}
+                      disabled={loading === "gitee"}
+                      title={t("backup.gitee.repoLabel")}
+                      placeholder={t("backup.gitee.repoPlaceholder")}
+                      className="h-8 w-52 rounded-lg border border-border-subtle bg-background px-2.5 font-mono text-[13px] text-secondary outline-none transition-colors focus:border-border disabled:opacity-50"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                    />
+                    <input
+                      type="password"
+                      value={giteeToken}
+                      onChange={(event) => {
+                        setGiteeToken(event.target.value);
+                        setGiteeError(null);
+                      }}
+                      placeholder={t("backup.gitee.tokenPlaceholder")}
+                      disabled={loading === "gitee"}
+                      className="h-8 min-w-0 flex-1 rounded-lg border border-border-subtle bg-background px-2.5 font-mono text-[13px] text-secondary outline-none transition-colors focus:border-border disabled:opacity-50"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                    />
+                    <button
+                      type="button"
+                      onClick={handleGiteeConnect}
+                      disabled={!!loading || !giteeToken.trim()}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface-hover px-2.5 text-[13px] font-medium text-tertiary transition-colors hover:bg-surface-active disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {loading === "gitee" && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      {loading === "gitee" ? t("backup.gitee.connecting") : t("backup.gitee.connect")}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void openUrl(GITEE_TOKEN_URL)}
+                    className="inline-flex items-center gap-1 text-[12px] text-muted transition-colors hover:text-secondary"
+                  >
+                    <ExternalLink className="h-3 w-3" />
+                    {t("backup.gitee.tokenHint")}
+                  </button>
+                  <p className="text-[12px] leading-4 text-faint">{t("backup.gitee.repoHint")}</p>
+                  <p className="text-[12px] leading-4 text-faint">{t("backup.gitee.sshHint")}</p>
+                  {giteeError && (
+                    <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-[12px] leading-5 text-red-600 dark:text-red-300">
+                      {giteeError}
+                    </div>
+                  )}
+                </div>
+              ) : connectProvider === "gitlab" ? (
                 // GitLab guided connect: PAT only — GitLab (especially
                 // self-hosted) has no device-flow login.
                 <div className="space-y-2">
@@ -1505,6 +1634,8 @@ export function Backup() {
               <p className="mt-2 text-[12px] leading-4 text-faint">
                 {isGitlabProvider
                   ? t("backup.gitlab.revokeHintPat")
+                  : isGiteeProvider
+                  ? t("backup.gitee.revokeHintPat")
                   : authMethod === "pat"
                   ? t("backup.disconnect.revokeHintPat")
                   : authMethod === "oauth"
@@ -1520,6 +1651,8 @@ export function Backup() {
                 <p className="mt-1 text-[12px] leading-4 text-red-700/80 dark:text-red-300/80">
                   {isGitlabProvider
                     ? t("backup.gitlab.deleteRemoteDesc")
+                    : isGiteeProvider
+                    ? t("backup.gitee.deleteRemoteDesc")
                     : t("backup.disconnect.deleteRemoteDesc")}
                 </p>
                 <button
@@ -1572,9 +1705,13 @@ export function Backup() {
         open={revokeConfirmOpen}
         title={isGitlabProvider
           ? t("backup.gitlab.revokeConfirmTitle")
+          : isGiteeProvider
+          ? t("backup.gitee.revokeConfirmTitle")
           : t("backup.disconnect.revokeConfirmTitle")}
         message={isGitlabProvider
           ? t("backup.gitlab.revokeConfirmPat")
+          : isGiteeProvider
+          ? t("backup.gitee.revokeConfirmPat")
           : authMethod === "pat"
           ? t("backup.disconnect.revokeConfirmPat")
           : authMethod === "oauth"
@@ -1590,6 +1727,8 @@ export function Backup() {
         title={t("backup.disconnect.deleteRemoteAction")}
         message={isGitlabProvider
           ? t("backup.gitlab.deleteRemoteConfirm")
+          : isGiteeProvider
+          ? t("backup.gitee.deleteRemoteConfirm")
           : t("backup.disconnect.deleteRemoteConfirm")}
         confirmLabel={t("backup.disconnect.deleteRemoteAction")}
         onClose={() => setDeleteRemoteConfirmOpen(false)}

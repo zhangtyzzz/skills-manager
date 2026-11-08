@@ -1,6 +1,6 @@
 use crate::core::{
     central_repo, error::AppError, git2_engine, git_backup, git_credentials, git_fetcher,
-    github_api, gitlab_api, merge, skill_metadata, sync_metadata,
+    gitee_api, github_api, gitlab_api, merge, skill_metadata, sync_metadata,
 };
 use anyhow::Context;
 use std::path::Path;
@@ -363,6 +363,86 @@ pub async fn gitlab_backup_connect(
             login: info.username,
             repo_created: info.project_created,
             repo_private: info.project_private,
+            remote_has_content,
+        })
+    })
+    .await?
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GiteeBackupConnectResult {
+    /// Credential-free HTTPS URL of the backup repository.
+    pub url: String,
+    pub login: String,
+    pub repo_created: bool,
+    /// False when the connected repository is not `private` — the UI warns;
+    /// app-created repositories are always private.
+    pub repo_private: bool,
+    /// True when the remote already has commits — the frontend restores
+    /// (clones) instead of initializing a fresh backup.
+    pub remote_has_content: bool,
+}
+
+/// Gitee guided connect: validate the PAT (私人令牌) against gitee.com, find
+/// the repository — creating a private one under the token owner's personal
+/// namespace for a bare name — store the token in the OS keychain (username
+/// = Gitee login, password = token, as Gitee's HTTPS git endpoint expects),
+/// and save the credential-free URL. Gitee has no Device Flow, so the PAT is
+/// the only guided auth path.
+#[tauri::command]
+pub async fn gitee_backup_connect(
+    store: State<'_, Arc<SkillStore>>,
+    token: String,
+    repo_path: String,
+) -> Result<GiteeBackupConnectResult, AppError> {
+    let store = store.inner().clone();
+    sync_engine_pref(&store);
+    tokio::task::spawn_blocking(move || {
+        let token = token.trim();
+        let repo_path = repo_path.trim();
+        if token.is_empty() {
+            return Err(AppError::invalid_input("Token is empty"));
+        }
+        let valid = if repo_path.contains('/') {
+            gitee_api::is_valid_repo_path(repo_path)
+        } else {
+            gitee_api::is_valid_repo_name(repo_path)
+        };
+        if !valid {
+            return Err(AppError::invalid_input("Invalid repository path"));
+        }
+
+        let proxy_url = store.proxy_url();
+        let info = gitee_api::connect_backup_repo(token, repo_path, proxy_url.as_deref())
+            .map_err(AppError::network)?;
+
+        let host = git_credentials::https_host(&info.url)
+            .context("GITEE_NETWORK: remote URL has no https host")
+            .map_err(AppError::internal)?;
+        git_credentials::store_credential(
+            &host,
+            &git_credentials::RemoteCredential {
+                username: info.username.clone(),
+                password: token.to_string(),
+            },
+        )
+        .map_err(|e| AppError::internal(format!("KEYCHAIN_UNAVAILABLE: {e:#}")))?;
+
+        store
+            .set_setting("git_backup_remote_url", &info.url)
+            .map_err(AppError::db)?;
+        store
+            .set_setting("git_backup_provider", "gitee")
+            .map_err(AppError::db)?;
+
+        let remote_has_content =
+            git_backup::remote_has_heads(&info.url).map_err(classify_git_chain)?;
+
+        Ok(GiteeBackupConnectResult {
+            url: info.url,
+            login: info.username,
+            repo_created: info.repo_created,
+            repo_private: info.repo_private,
             remote_has_content,
         })
     })
