@@ -5,6 +5,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.45.0] - 2026-11-08
+
+### 发布概览
+- 备份迎来第三个引导式提供商：Gitee。和现有的 GitHub、GitLab 流程一样，一个私人令牌即可在 gitee.com 上建好私有备份仓库。本版本同时补上了 1.44.0 已发布但漏记的 GitLab 引导连接说明。
+
+### 用户可见更新
+- **备份：Gitee 引导连接** — 备份页连接卡片的切换开关变为 GitHub / GitLab / Gitee。粘贴具备 `projects` 和 `user_info` 权限的 Gitee 私人令牌：填裸仓库名会在你的个人命名空间自动创建私有备份仓库，填完整路径（如 `owner/repo`）则连接已有仓库。令牌按 `gitee.com` 存入系统钥匙串——用户名填 Gitee 登录名、密码填令牌，正是 Gitee HTTPS git 端点要求的组合——且不会出现在任何 URL 或日志中。Gitee 不支持设备码登录，引导连接即令牌方式；SSH 用户可继续把远程地址粘贴到高级 Git 地址中。撤销授权 / 重连 / 删除远端的指引也会按提供商区分（#3）。
+- **备份：GitLab 引导连接** — （随 1.44.0 发布，但发版说明留空，此处补记。）备份页连接卡片新增 GitHub / GitLab 切换。GitLab 支持 gitlab.com 或自建实例（数据不出内网的企业场景）：粘贴带 `api` 权限的个人访问令牌，填裸项目名会在个人命名空间自动创建私有项目，填完整路径（如 `group/team/backup`）则连接已有项目。令牌按域名存入系统钥匙串（同步引擎本来就在用的存储），撤销授权 / 重连 / 删除远端的指引也会按提供商区分。GitLab 不支持设备码登录，引导连接即令牌方式；SSH 用户可继续在 **设置 → Git 同步配置** 粘贴远程地址。
+
+### 开发者与治理更新
+- Gitee 提供商按 AGENTS.md 的 provider 清单实现：`core/gitee_api.rs`（OpenAPI v5 客户端，令牌只走 `Authorization: Bearer` 头，不进 URL 和日志）、`gitee_backup_connect` 命令、`src/lib/tauri.ts` 类型化包装、`Backup.tsx` 提供商标签页（内联 Gitee 图标）、`git_backup_provider=gitee` 设置值，以及 `en.json` + `zh.json` 的 `backup.gitee.*` 文案（#3）。
+
 ## [1.44.0] - 2026-11-07
 
 ### 发布概览
@@ -16,9 +28,6 @@
 ### 开发者与治理更新
 - 
 ## [Unreleased]
-
-### 用户可见更新
-- **备份：GitLab 引导连接** —— 备份页连接卡片新增 GitHub / GitLab 切换。GitLab 支持 gitlab.com 或自建实例（数据不出内网的企业场景）：粘贴带 `api` 权限的个人访问令牌，填裸项目名会在个人命名空间自动创建私有项目，填完整路径（如 `group/team/backup`）则连接已有项目。令牌按域名存入系统钥匙串（同步引擎本来就在用的存储），撤销授权 / 重连 / 删除远端的指引也会按提供商区分。GitLab 不支持设备码登录，引导连接即令牌方式；SSH 用户可继续在 **设置 → Git 同步配置** 粘贴远程地址。
 
 ## [1.43.3] - 2026-11-03
 

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.45.0] - 2026-11-08
+
+### Release Overview
+- Backup gains a third guided provider: Gitee. One personal access token sets up a private backup repository on gitee.com, alongside the existing GitHub and GitLab flows. This release also documents the guided GitLab connect, which shipped in 1.44.0 without release notes.
+
+### User-facing
+- **Backup: guided Gitee connect** — The Backup page's connect card now has a GitHub / GitLab / Gitee switch. Paste a Gitee personal access token (私人令牌) with the `projects` and `user_info` scopes: a bare repository name auto-creates a private backup repository in your personal namespace, and a full path like `owner/repo` connects an existing one. The token is stored in the OS keychain keyed by `gitee.com` — username = your Gitee login, password = the token, exactly what Gitee's HTTPS git endpoint expects — and never appears in URLs or logs. Gitee has no device-flow sign-in, so the token is the guided path; SSH users can keep pasting a remote URL into the advanced Git URL section. Revoke / reconnect / delete-remote guidance is provider-aware (#3).
+- **Backup: guided GitLab connect** — (Shipped in 1.44.0, but its notes were left empty.) The Backup page's connect card gains a GitHub / GitLab switch. GitLab works with gitlab.com or a self-hosted instance (for teams whose data must stay in-house): paste a personal access token with the `api` scope and a bare project name to auto-create a private project in your personal namespace, or a full path like `group/team/backup` to connect an existing project. The token is stored in the OS keychain keyed by host — the same storage the sync engine already uses — and revoke/reconnect/delete-remote guidance is provider-aware. GitLab has no device-flow sign-in, so the PAT is the guided path; SSH users can keep pasting a remote URL under **Settings → Git Sync Configuration**.
+
+### Developer & Governance
+- The Gitee provider follows the AGENTS.md provider checklist: a `core/gitee_api.rs` OpenAPI v5 client whose token travels only in the `Authorization: Bearer` header (never URLs or logs), the `gitee_backup_connect` command, a typed wrapper in `src/lib/tauri.ts`, a provider tab in `Backup.tsx` with an inline Gitee mark, the `git_backup_provider=gitee` setting value, and `backup.gitee.*` keys in `en.json` + `zh.json` (#3).
+
 ## [1.44.0] - 2026-11-07
 
 ### Release Overview
@@ -16,9 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Developer & Governance
 - 
 ## [Unreleased]
-
-### User-facing
-- **Backup: guided GitLab connect** — The Backup page's connect card gains a GitHub / GitLab switch. GitLab works with gitlab.com or a self-hosted instance (for teams whose data must stay in-house): paste a personal access token with the `api` scope and a bare project name to auto-create a private project in your personal namespace, or a full path like `group/team/backup` to connect an existing project. The token is stored in the OS keychain keyed by host — the same storage the sync engine already uses — and revoke/reconnect/delete-remote guidance is provider-aware. GitLab has no device-flow sign-in, so the PAT is the guided path; SSH users can keep pasting a remote URL under **Settings → Git Sync Configuration**.
 
 ## [1.43.3] - 2026-11-03
 
